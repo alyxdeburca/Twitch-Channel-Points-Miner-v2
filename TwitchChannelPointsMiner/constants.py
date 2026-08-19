@@ -41,7 +41,7 @@ class GQLOperations:
     }
     VideoPlayerStreamInfoOverlayChannel = {
         "operationName": "VideoPlayerStreamInfoOverlayChannel",
-        "query": "query VideoPlayerStreamInfoOverlayChannel($channel: String!){user(login:$channel){stream{id tags{id} viewersCount} broadcastSettings{title game{id displayName}}}}",
+        "query": "query VideoPlayerStreamInfoOverlayChannel($channel: String!){user(login:$channel){stream{id tags{id} viewersCount} broadcastSettings{title game{id name displayName}}}}",
     }
     ClaimCommunityPoints = {
         "operationName": "ClaimCommunityPoints",
