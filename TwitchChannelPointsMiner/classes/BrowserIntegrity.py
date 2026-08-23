@@ -7,13 +7,20 @@ rejected on protected mutations (bonus claims) with IntegrityCheckFailed,
 even with correct cookies/headers. Running the request from inside a
 real Chromium produces a trusted token.
 
+Threading model: Playwright's sync API is bound to the thread that
+created it ("Cannot switch to a different thread" otherwise). ALL browser
+work therefore happens on ONE dedicated worker thread; other miner
+threads request tokens through a queue and wait on a Future.
+
 Requires the optional dependency:
 
     pip install playwright && python -m playwright install chromium
 """
 import logging
+import queue
 import threading
 import time
+import concurrent.futures
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -24,7 +31,7 @@ class BrowserUnavailable(Exception):
 
 
 class BrowserIntegrity(object):
-    """Lazily-started headless Chromium that returns integrity tokens."""
+    """Headless-Chromium integrity-token minter, safe for multi-thread use."""
 
     def __init__(self, auth_token=None, data_dir=None, auth_token_provider=None):
         # Either a static token or (preferably) a callable returning the
@@ -32,12 +39,18 @@ class BrowserIntegrity(object):
         self.auth_token = auth_token
         self._auth_token_provider = auth_token_provider
         self.data_dir = str(data_dir) if data_dir else None
+
+        self.token = None
+        self.expires = 0
+
         self._lock = threading.Lock()
+        self._jobs = queue.Queue()
+        self._worker = None
+        self._stopping = False
+        # Browser objects - touched ONLY on the worker thread
         self._playwright = None
         self._context = None
         self._page = None
-        self.token = None
-        self.expires = 0
 
     def _current_auth_token(self):
         if self._auth_token_provider is not None:
@@ -47,6 +60,121 @@ class BrowserIntegrity(object):
                 return None
         return self.auth_token
 
+    # ------------------------------------------------------------------ #
+    # Public API (any thread)
+    # ------------------------------------------------------------------ #
+    def get_token(self, force=False):
+        """Return an integrity token. Thread-safe."""
+        if not force and self.token and time.time() < self.expires - 120:
+            return self.token
+
+        with self._lock:
+            if self._stopping:
+                raise BrowserUnavailable("browser integrity is shutting down")
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(
+                    target=self._worker_loop,
+                    name="browser-integrity",
+                    daemon=True,
+                )
+                self._worker.start()
+
+        future = concurrent.futures.Future()
+        self._jobs.put((bool(force), future))
+        # Generous timeout: cold start launches Chromium + loads twitch.tv
+        return future.result(timeout=150)
+
+    def stop(self):
+        """Signal the worker to shut the browser down (best effort)."""
+        self._stopping = True
+        try:
+            self._jobs.put_nowait(None)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    # Worker thread - owns every Playwright interaction
+    # ------------------------------------------------------------------ #
+    def _worker_loop(self):
+        logger.info("Browser-integrity worker started")
+        while True:
+            job = self._jobs.get()
+            if job is None or self._stopping:
+                break
+            _, future = job
+            if future.done():
+                continue
+            try:
+                future.set_result(self._mint())
+            except Exception as e:
+                message = str(e).splitlines()[0][:200]
+                logger.warning(f"Browser token minting failed: {message}")
+                future.set_exception(BrowserUnavailable(message))
+        self._shutdown_browser()
+        logger.info("Browser-integrity worker stopped")
+
+    def _mint(self):
+        last_error = None
+        payload = None
+        for attempt in range(2):
+            try:
+                self._ensure_browser()
+                payload = self._fetch_via_js()
+                if payload and payload.get("token"):
+                    break
+                last_error = f"no token in payload: {str(payload)[:120]}"
+                logger.warning(
+                    f"Browser token attempt {attempt + 1}/2: {last_error}"
+                )
+                self._teardown_page()  # rebuild the page for the next try
+            except Exception as e:
+                last_error = str(e).splitlines()[0][:160]
+                logger.warning(
+                    f"Browser token attempt {attempt + 1}/2 failed: {last_error}"
+                )
+                self.stop_page_and_rebuild()
+
+        token = (payload or {}).get("token")
+        if not token:
+            raise BrowserUnavailable(f"browser minting failed: {last_error}")
+
+        exp_ms = int((payload or {}).get("expiration") or 0)
+        if exp_ms > 10_000_000_000:  # epoch-ms
+            self.expires = exp_ms / 1000
+        else:
+            self.expires = time.time() + 1800
+        self.token = token
+        logger.info(
+            f"Browser integrity token acquired (valid ~{int(self.expires - time.time())}s)"
+        )
+        return token
+
+    def stop_page_and_rebuild(self):
+        """Tear down context so the next attempt starts clean."""
+        try:
+            if self._context:
+                self._context.close()
+        except Exception:
+            pass
+        try:
+            if self._playwright:
+                self._playwright.stop()
+        except Exception:
+            pass
+        self._context = None
+        self._playwright = None
+        self._page = None
+
+    def _teardown_page(self):
+        try:
+            if self._page:
+                self._page.close()
+        except Exception:
+            pass
+        self._page = None
+
+    # ------------------------------------------------------------------ #
+    # Browser internals (worker thread only!)
     # ------------------------------------------------------------------ #
     def _ensure_browser(self):
         if self._page is not None:
@@ -63,10 +191,25 @@ class BrowserIntegrity(object):
         logger.info("Starting headless Chromium for integrity tokens...")
         self._playwright = sync_playwright().start()
         try:
+            # Realistic Chrome UA + steady locale/timezone so Twitch's
+            # signal collection sees a coherent environment.
+            ua = (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            )
             self._context = self._playwright.chromium.launch_persistent_context(
                 self.data_dir,
                 headless=True,
-                args=["--disable-blink-features=AutomationControlled"],
+                user_agent=ua,
+                locale="en-US",
+                timezone_id="Europe/London",
+                viewport={"width": 1280, "height": 800},
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--lang=en-US",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
             )
             auth_token = self._current_auth_token()
             if auth_token:
@@ -81,46 +224,49 @@ class BrowserIntegrity(object):
                     ]
                 )
             self._page = self._context.new_page()
-            self._page.goto(
-                "https://www.twitch.tv/", wait_until="domcontentloaded", timeout=60000
+            self._page.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
             )
+            self._page.goto(
+                "https://www.twitch.tv/",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            # Give Twitch's own protection script (p.js) time to install -
+            # fetching too early causes 'Failed to fetch'.
+            try:
+                self._page.wait_for_load_state("networkidle", timeout=30000)
+            except Exception:
+                pass
+            self._page.wait_for_timeout(2500)
             logger.info("Headless Chromium ready")
         except Exception:
-            self.stop()
+            self._shutdown_browser()
             raise
 
-    # ------------------------------------------------------------------ #
-    def get_token(self, force=False):
-        """Return a (hopefully fresh) integrity token, or raise."""
-        with self._lock:
-            if (
-                not force
-                and self.token
-                and time.time() < self.expires - 120
-            ):
-                return self.token
-            self._ensure_browser()
-            payload = self._page.evaluate(
-                "fetch('https://gql.twitch.tv/integrity',"
-                "{method:'POST',credentials:'include'})"
-                ".then(r=>r.json())"
-            )
-            self.token = (payload or {}).get("token") or None
-            if not self.token:
-                raise BrowserUnavailable(f"Browser returned no token: {payload}")
-            exp_ms = int((payload or {}).get("expiration") or 0)
-            if exp_ms > 10_000_000_000:  # epoch-ms
-                self.expires = exp_ms / 1000
-            else:
-                self.expires = time.time() + 1800
-            logger.info(
-                f"Browser integrity token acquired (valid ~"
-                f"{int(self.expires - time.time())}s)"
-            )
-            return self.token
+    def _fetch_via_js(self):
+        """Synchronous in-page XHR to /integrity - PROVEN WORKING.
 
-    # ------------------------------------------------------------------ #
-    def stop(self):
+        (Async fetch/XHR via page.evaluate fails with network errors;
+        a blocking sync XHR succeeds and returns the token payload.)"""
+        js = """
+() => {
+  const x = new XMLHttpRequest();
+  x.open('POST', 'https://gql.twitch.tv/integrity', false);  // sync
+  x.setRequestHeader('Client-Id', 'kimne78kx3ncx6brgo4mv6wki5h1ko');
+  try { x.send(null); }
+  catch (e) { return {error: String(e)}; }
+  if (x.status !== 200) return {error: 'HTTP ' + x.status, body: x.responseText.slice(0, 200)};
+  try { return JSON.parse(x.responseText); }
+  catch (e) { return {error: 'parse: ' + String(e), body: x.responseText.slice(0, 200)}; }
+}
+"""
+        result = self._page.evaluate(js)
+        if not isinstance(result, dict) or "token" not in result:
+            raise BrowserUnavailable(f"page returned: {str(result)[:160]}")
+        return result
+
+    def _shutdown_browser(self):
         try:
             if self._context:
                 self._context.close()
