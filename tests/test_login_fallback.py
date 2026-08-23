@@ -76,6 +76,39 @@ class LoginFallbackTests(unittest.TestCase):
             backup.assert_called_once()
             self.assertEqual(login.token, "browser-token")
 
+    def test_safari_option_loads_cookies(self):
+        login = make_login()
+        fake_bc3 = mock.MagicMock()
+        fake_bc3.safari.return_value = object()
+        answers = iter(["4", ""])  # browser choice, then "press Enter"
+        with mock.patch(
+            "TwitchChannelPointsMiner.classes.TwitchLogin.browser_cookie3", fake_bc3
+        ), mock.patch(
+            "builtins.input", side_effect=lambda *a: next(answers)
+        ), mock.patch(
+            "TwitchChannelPointsMiner.classes.TwitchLogin.requests.utils.dict_from_cookiejar",
+            return_value={"login": "safariuser", "auth-token": "tok-saf"},
+        ):
+            token = login.login_flow_backup()
+        self.assertEqual(token, "tok-saf")
+        self.assertEqual(login.username, "safariuser")
+        fake_bc3.safari.assert_called_once()
+
+    def test_missing_auth_token_returns_none_with_hint(self):
+        login = make_login()
+        fake_bc3 = mock.MagicMock()
+        fake_bc3.chrome.return_value = object()
+        answers = iter(["1", ""])
+        with mock.patch(
+            "TwitchChannelPointsMiner.classes.TwitchLogin.browser_cookie3", fake_bc3
+        ), mock.patch(
+            "builtins.input", side_effect=lambda *a: next(answers)
+        ), mock.patch(
+            "TwitchChannelPointsMiner.classes.TwitchLogin.requests.utils.dict_from_cookiejar",
+            return_value={"login": "someone"},  # no auth-token
+        ):
+            self.assertIsNone(login.login_flow_backup())
+
     def test_bad_credentials_still_raise_when_password_configured(self):
         login = make_login()  # password configured -> no interactive retry
         with mock.patch.object(

@@ -164,30 +164,60 @@ class TwitchLogin(object):
 
     def login_flow_backup(self):
         """Backup OAuth login flow in case manual captcha solving is required"""
+
+        def _safari():
+            try:
+                return browser_cookie3.safari(domain_name=twitch_domain)
+            except TypeError:
+                # Older browser_cookie3 releases have no domain_name kwarg
+                return browser_cookie3.safari()
+
         browser = input(
-            "What browser do you use? Chrome (1), Firefox (2), Other/any installed (3): "
+            "What browser do you use? Chrome (1), Firefox (2), "
+            "Auto-detect any installed (3), Safari (4): "
         ).strip()
         twitch_domain = ".twitch.tv"
-        if browser == "1":  # chrome
-            cookie_jar = browser_cookie3.chrome(domain_name=twitch_domain)
-        elif browser == "2":
-            cookie_jar = browser_cookie3.firefox(domain_name=twitch_domain)
-        elif browser == "3":
-            cookie_jar = browser_cookie3.load(domain_name=twitch_domain)
-        else:
+        loaders = {
+            "1": ("Chrome", lambda: browser_cookie3.chrome(domain_name=twitch_domain)),
+            "2": ("Firefox", lambda: browser_cookie3.firefox(domain_name=twitch_domain)),
+            "3": (
+                "your installed browsers",
+                lambda: browser_cookie3.load(domain_name=twitch_domain),
+            ),
+            "4": ("Safari", _safari),
+        }
+        if browser not in loaders:
             logger.info("Your browser is unsupported, sorry.")
             return None
 
+        browser_name, load_cookies = loaders[browser]
         input(
-            "Please login inside your browser of choice (NOT incognito mode) and press Enter..."
+            f"Please log in to twitch.tv inside {browser_name} "
+            "(NOT a private/incognito window) and press Enter..."
         )
-        logger.info("Loading cookies saved on your computer...")
-        cookies_dict = requests.utils.dict_from_cookiejar(cookie_jar)
+        logger.info(f"Loading cookies saved on your computer ({browser_name})...")
+        try:
+            cookies_dict = requests.utils.dict_from_cookiejar(load_cookies())
+        except Exception as e:
+            logger.error(
+                f"Could not read cookies from {browser_name}: {e}. "
+                "On macOS, allow Full Disk Access for your terminal app "
+                "(System Settings > Privacy & Security > Full Disk Access), "
+                "then run this again."
+            )
+            return None
+
+        if not cookies_dict.get("auth-token"):
+            logger.error(
+                f"No Twitch auth-token found - log in to twitch.tv in {browser_name} first."
+            )
+            return None
+
         # Only override the configured username if the browser told us one,
         # otherwise check_login() would later query GQL with channelLogin=None.
         if cookies_dict.get("login"):
             self.username = cookies_dict["login"]
-        return cookies_dict.get("auth-token")
+        return cookies_dict["auth-token"]
 
     def check_login(self):
         if self.login_check_result:
