@@ -157,6 +157,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   #toast.ok { border-color:rgba(34,197,94,.5); color:var(--green); }
   #toast.err { border-color:rgba(239,68,68,.5); color:var(--red); }
+  #conn-error {
+    display:none; margin-bottom:16px; padding:12px 16px; border-radius:10px;
+    border:1px solid rgba(239,68,68,.5); background:rgba(239,68,68,.1);
+    color:#fca5a5; font-size:13px; line-height:1.5;
+  }
   .card-gear {
     border:none; background:transparent; color:var(--dim); cursor:pointer;
     font-size:14px; padding:2px 6px; border-radius:5px;
@@ -205,6 +210,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </header>
 
 <main>
+  <div id="conn-error"></div>
   <div id="stats"></div>
   <div class="grid">
     <section class="panel">
@@ -555,10 +561,16 @@ setInterval(() => {
 async function tick() {
   try {
     const r = await fetch("/api/all");
-    if (!r.ok) throw new Error(r.status);
-    renderAll(await r.json());
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const data = await r.json();
+    renderAll(data);
+    $("conn-error").style.display = "none";
   } catch (err) {
-    $("upd").textContent = "connection error — retrying…";
+    const el = $("conn-error");
+    el.style.display = "block";
+    el.innerHTML = "⚠ Can't reach the miner API (" + esc(String(err.message || err)) +
+      "). The page will keep retrying every 3s. If this persists, update the repo " +
+      "(git pull) and restart the miner — check its console for errors.";
   }
 }
 tick();
