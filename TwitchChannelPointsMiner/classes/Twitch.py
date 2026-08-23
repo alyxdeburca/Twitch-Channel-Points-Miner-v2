@@ -98,7 +98,7 @@ class Twitch(object):
             headers = {"User-Agent": self.user_agent}
             main_page_request = requests.get(streamer.streamer_url, headers=headers)
             response = main_page_request.text
-            regex_settings = "(https://static.twitchcdn.net/config/settings.*?js)"
+            regex_settings = r"(https://(?:static\.twitchcdn\.net|assets\.twitch\.tv)/config/settings[^\"']*?\.js)"
             settings_url = re.search(regex_settings, response).group(1)
 
             settings_request = requests.get(settings_url, headers=headers)
