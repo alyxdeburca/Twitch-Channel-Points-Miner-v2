@@ -74,9 +74,23 @@ loads its points context, joins its chat (per settings) and subscribes to
 its WebSocket topics immediately - no restart needed. Removing stops
 tracking it right away; points already earned stay in your account.
 
-These mutations call `twitch_miner.add_streamer(name)` /
-`remove_streamer(name)`, which you can also use programmatically.
-The demo server supports them too (in-memory only).
+The **⚙ button** on each card opens a full settings editor applied live:
+
+- Mining: make predictions, follow raids, claim drops, watch streak,
+  chat presence (ALWAYS / NEVER / ONLINE / OFFLINE - the IRC client is
+  started/stopped accordingly)
+- Betting: strategy (MOST_VOTED, HIGH_ODDS, PERCENTAGE, SMART_MONEY,
+  SMART), bet % of points, SMART gap, max/minimum points, stealth mode,
+  delay + delay mode
+- Filter condition: by / where / value, or disabled entirely
+
+All values are validated server-side with sensible ranges and clear error
+messages; changes take effect on the next prediction for that channel.
+These mutations call `twitch_miner.add_streamer(name)`,
+`remove_streamer(name)` and `update_streamer_settings(name, settings)`,
+which you can also use programmatically. The demo server supports them
+too (in-memory only). Settings are per streamer and not persisted to your
+run.py - restart resets to whatever the file defines.
 
 ## HTTP API
 
@@ -90,6 +104,7 @@ The demo server supports them too (in-memory only).
 | `/api/all` | everything above in one payload |
 | `POST /api/streamers/add` | body `{"username": "name"}` — track a new streamer |
 | `POST /api/streamers/remove` | body `{"username": "name"}` — stop tracking |
+| `POST /api/streamers/settings` | body `{"username": "name", "settings": {...}}` — change settings live |
 
 All require an authenticated session when OAuth is configured.
 

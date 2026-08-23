@@ -22,6 +22,23 @@ from TwitchChannelPointsMiner.dashboard_auth import (
 
 logger = logging.getLogger(__name__)
 
+# Choices exposed to the dashboard settings editor.
+SETTINGS_OPTIONS = {
+    "chat": ["ALWAYS", "NEVER", "ONLINE", "OFFLINE"],
+    "strategy": ["MOST_VOTED", "HIGH_ODDS", "PERCENTAGE", "SMART_MONEY", "SMART"],
+    "delay_mode": ["FROM_START", "FROM_END", "PERCENTAGE"],
+    "filter_by": [
+        "NONE",
+        "PERCENTAGE_USERS",
+        "ODDS_PERCENTAGE",
+        "ODDS",
+        "TOP_POINTS",
+        "TOTAL_USERS",
+        "TOTAL_POINTS",
+    ],
+    "filter_where": ["GT", "LT", "GTE", "LTE"],
+}
+
 # Millify is an existing dependency of the miner; fall back to raw numbers
 try:
     from millify import millify
@@ -43,6 +60,105 @@ def _safe(fn, default=None):
         return fn()
     except Exception:
         return default
+
+
+def _parse_settings_payload(update):
+    """Validate a dashboard settings payload (string-typed enums).
+
+    Raises ValueError with a user-readable message on bad input.
+    Used by the demo mode; the live miner applies its own stricter
+    typed validation in TwitchChannelPointsMiner.update_streamer_settings.
+    """
+    if not isinstance(update, dict):
+        raise ValueError("settings payload must be an object")
+    parsed = {}
+
+    for flag in ("make_predictions", "follow_raid", "claim_drops", "watch_streak"):
+        if flag in update and update[flag] is not None:
+            parsed[flag] = bool(update[flag])
+
+    if "chat" in update and update["chat"] is not None:
+        chat = str(update["chat"]).upper()
+        if chat not in SETTINGS_OPTIONS["chat"]:
+            raise ValueError("chat must be one of " + ", ".join(SETTINGS_OPTIONS["chat"]))
+        parsed["chat"] = chat
+
+    bet_update = update.get("bet") or {}
+    if not isinstance(bet_update, dict):
+        raise ValueError("bet must be an object")
+    bet = {}
+
+    if "strategy" in bet_update and bet_update["strategy"] is not None:
+        strategy = str(bet_update["strategy"]).upper()
+        if strategy not in SETTINGS_OPTIONS["strategy"]:
+            raise ValueError(
+                "bet.strategy must be one of " + ", ".join(SETTINGS_OPTIONS["strategy"])
+            )
+        bet["strategy"] = strategy
+
+    for field in ("percentage", "percentage_gap", "max_points", "minimum_points"):
+        if field in bet_update and bet_update[field] is not None:
+            try:
+                value = int(bet_update[field])
+            except (TypeError, ValueError):
+                raise ValueError(f"bet.{field} must be an integer")
+            limits = {
+                "percentage": (1, 100),
+                "percentage_gap": (0, 100),
+                "max_points": (0, 10**9),
+                "minimum_points": (0, 10**9),
+            }
+            low, high = limits[field]
+            if not low <= value <= high:
+                raise ValueError(f"bet.{field} must be between {low} and {high}")
+            bet[field] = value
+
+    if "stealth_mode" in bet_update and bet_update["stealth_mode"] is not None:
+        bet["stealth_mode"] = bool(bet_update["stealth_mode"])
+
+    if "delay" in bet_update and bet_update["delay"] is not None:
+        try:
+            delay = float(bet_update["delay"])
+        except (TypeError, ValueError):
+            raise ValueError("bet.delay must be a number")
+        if not 0 <= delay <= 1200:
+            raise ValueError("bet.delay must be between 0 and 1200 seconds")
+        bet["delay"] = delay
+
+    if "delay_mode" in bet_update and bet_update["delay_mode"] is not None:
+        mode = str(bet_update["delay_mode"]).upper()
+        if mode not in SETTINGS_OPTIONS["delay_mode"]:
+            raise ValueError(
+                "bet.delay_mode must be one of " + ", ".join(SETTINGS_OPTIONS["delay_mode"])
+            )
+        bet["delay_mode"] = mode
+
+    if "filter_condition" in bet_update:
+        fc = bet_update["filter_condition"]
+        if fc is None or (isinstance(fc, dict) and str(fc.get("by", "")).upper() == "NONE"):
+            bet["filter_condition"] = None
+        elif isinstance(fc, dict):
+            by = str(fc.get("by", "")).upper()
+            where = str(fc.get("where", "")).upper()
+            if by != "NONE" and by not in SETTINGS_OPTIONS["filter_by"]:
+                raise ValueError(
+                    "filter_condition.by must be one of " + ", ".join(SETTINGS_OPTIONS["filter_by"])
+                )
+            if where not in SETTINGS_OPTIONS["filter_where"]:
+                raise ValueError(
+                    "filter_condition.where must be one of "
+                    + ", ".join(SETTINGS_OPTIONS["filter_where"])
+                )
+            try:
+                value = float(fc.get("value"))
+            except (TypeError, ValueError):
+                raise ValueError("filter_condition.value must be a number")
+            bet["filter_condition"] = {"by": by, "where": where, "value": value}
+        else:
+            raise ValueError("filter_condition must be null or an object")
+
+    parsed["bet"] = bet
+    return parsed
 
 
 class StateProvider(object):
@@ -70,7 +186,22 @@ class StateProvider(object):
                     "follow_raid": True,
                     "claim_drops": True,
                     "watch_streak": True,
-                    "bet": {"strategy": "SMART", "percentage": 5, "max_points": 50000},
+                    "chat": "ALWAYS",
+                    "bet": {
+                        "strategy": "SMART",
+                        "percentage": 5,
+                        "percentage_gap": 20,
+                        "max_points": 50000,
+                        "minimum_points": 0,
+                        "stealth_mode": True,
+                        "delay": 6,
+                        "delay_mode": "FROM_END",
+                        "filter_condition": {
+                            "by": "TOTAL_USERS",
+                            "where": "LTE",
+                            "value": 800,
+                        },
+                    },
                 },
                 "history": {
                     "WATCH": {"counter": 214, "amount": 10700},
@@ -97,7 +228,18 @@ class StateProvider(object):
                     "follow_raid": True,
                     "claim_drops": False,
                     "watch_streak": True,
-                    "bet": {"strategy": "PERCENTAGE", "percentage": 5, "max_points": 1234},
+                    "chat": "NEVER",
+                    "bet": {
+                        "strategy": "PERCENTAGE",
+                        "percentage": 5,
+                        "percentage_gap": 20,
+                        "max_points": 1234,
+                        "minimum_points": 0,
+                        "stealth_mode": False,
+                        "delay": 6,
+                        "delay_mode": "FROM_END",
+                        "filter_condition": None,
+                    },
                 },
                 "history": {
                     "WATCH": {"counter": 96, "amount": 4800},
@@ -129,15 +271,32 @@ class StateProvider(object):
 
             settings_obj = getattr(s, "settings", None)
             bet_obj = getattr(settings_obj, "bet", None)
+            filter_obj = getattr(bet_obj, "filter_condition", None)
+            by_name = {v: k for k, v in _OUTCOME_KEYS_BY_NAME.items()}
             settings = {
-                "make_predictions": _safe(lambda: settings_obj.make_predictions),
-                "follow_raid": _safe(lambda: settings_obj.follow_raid),
-                "claim_drops": _safe(lambda: settings_obj.claim_drops),
-                "watch_streak": _safe(lambda: settings_obj.watch_streak),
+                "make_predictions": bool(_safe(lambda: settings_obj.make_predictions)),
+                "follow_raid": bool(_safe(lambda: settings_obj.follow_raid)),
+                "claim_drops": bool(_safe(lambda: settings_obj.claim_drops)),
+                "watch_streak": bool(_safe(lambda: settings_obj.watch_streak)),
+                "chat": str(_safe(lambda: settings_obj.chat)) or "NEVER",
                 "bet": {
-                    "strategy": _safe(lambda: str(bet_obj.strategy)),
-                    "percentage": _safe(lambda: bet_obj.percentage),
-                    "max_points": _safe(lambda: bet_obj.max_points),
+                    "strategy": str(_safe(lambda: bet_obj.strategy)) or "SMART",
+                    "percentage": _safe(lambda: bet_obj.percentage, 5),
+                    "percentage_gap": _safe(lambda: bet_obj.percentage_gap, 20),
+                    "max_points": _safe(lambda: bet_obj.max_points, 50000),
+                    "minimum_points": _safe(lambda: bet_obj.minimum_points, 0),
+                    "stealth_mode": bool(_safe(lambda: bet_obj.stealth_mode, False)),
+                    "delay": _safe(lambda: bet_obj.delay, 6),
+                    "delay_mode": str(_safe(lambda: bet_obj.delay_mode)) or "FROM_END",
+                    "filter_condition": None
+                    if filter_obj is None
+                    else {
+                        "by": by_name.get(
+                            _safe(lambda: filter_obj.by), "TOTAL_USERS"
+                        ),
+                        "where": str(_safe(lambda: filter_obj.where), "LTE"),
+                        "value": _safe(lambda: filter_obj.value, 0),
+                    },
                 },
             }
 
@@ -330,6 +489,7 @@ class DashboardServer(Thread):
                 "editable": True,
                 "demo": True,
                 "streamers": [s["username"] for s in self.state.streamers()],
+                "options": SETTINGS_OPTIONS,
             }
         return {
             "editable": _safe(lambda: self.state.miner.running, False) is not None,
@@ -337,6 +497,7 @@ class DashboardServer(Thread):
             "streamers": [
                 s.username for s in (_safe(lambda: list(self.state.miner.streamers), []) or [])
             ],
+            "options": SETTINGS_OPTIONS,
         }
 
     def add_streamer(self, username):
@@ -378,6 +539,43 @@ class DashboardServer(Thread):
                 return False, "attached miner does not support runtime changes"
             _, error = method(username)
             return error is None, error
+
+    def update_streamer_settings(self, username, update):
+        """Apply a settings update. Returns (ok, error)."""
+        username = str(username or "").strip()
+        if self.state.demo:
+            target = next(
+                (
+                    s
+                    for s in self.state.demo_streamers
+                    if s["username"] == username.lower()
+                ),
+                None,
+            )
+            if target is None:
+                return False, f"'{username}' is not being tracked"
+            try:
+                parsed = _parse_settings_payload(update)
+            except ValueError as e:
+                return False, str(e)
+            bet_update = parsed.pop("bet", {})
+            for field, value in bet_update.items():
+                target["settings"]["bet"][field] = value
+            for field, value in parsed.items():
+                target["settings"][field] = value
+            return True, None
+
+        with self.mutation_lock:
+            method = getattr(self.state.miner, "update_streamer_settings", None)
+            if method is None:
+                return False, "attached miner does not support runtime changes"
+            try:
+                method(username, update)
+            except ValueError as e:
+                return False, str(e)
+            except Exception as e:
+                return False, f"failed to apply: {e}"
+            return True, None
 
     def remove_streamer(self, username):
         """Remove a tracked streamer. Returns (ok, error)."""
@@ -604,6 +802,15 @@ class DashboardServer(Thread):
                     return self._json(
                         {"success": ok, "error": error},
                         status=200 if ok else 404,
+                    )
+                if path == "/api/streamers/settings":
+                    ok, error = server.update_streamer_settings(
+                        str(payload.get("username", "")),
+                        payload.get("settings") or {},
+                    )
+                    return self._json(
+                        {"success": ok, "error": error},
+                        status=200 if ok else 400,
                     )
                 return self._json({"error": "not found"}, status=404)
 

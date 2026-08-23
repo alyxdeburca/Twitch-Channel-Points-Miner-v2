@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """End-to-end tests for runtime streamer management via the dashboard API.
 
-Covers the demo mode (mutable backing list) and a live miner (fake miner
-object exercising TwitchChannelPointsMiner.add_streamer /
-remove_streamer semantics without touching Twitch).
+Covers demo mode (mutable backing list), settings editing/validation,
+and a live miner path (fake miner delegating to the real settings
+validator, so no network calls are made).
 """
 import json
 import os
 import time
 import unittest
+import urllib.error
 import urllib.request
 from unittest import mock
 
@@ -16,6 +17,8 @@ from TwitchChannelPointsMiner.dashboard_server import DashboardServer
 
 HOST, PORT = "127.0.0.1", 8183
 BASE = f"http://{HOST}:{PORT}"
+
+AUTH_VARS = ("TWITCH_CLIENT_ID", "TWITCH_CLIENT_SECRET", "DASHBOARD_ALLOWED_USERS")
 
 
 class FakeStreamer(object):
@@ -26,7 +29,7 @@ class FakeStreamer(object):
 
 
 class FakeMiner(object):
-    """Mimics the real add/remove semantics without network calls."""
+    """Mimics real miner semantics; uses the REAL settings validator."""
 
     running = True
     session_id = "fake"
@@ -36,14 +39,15 @@ class FakeMiner(object):
         self.streamers = [FakeStreamer("existing")]
         self.original_streamers = [100]
         self.calls = {"add": [], "remove": []}
+        self.settings_applied = []
 
     def add_streamer(self, username):
-        self.calls["add"].append(username)
+        self.calls["add"].append(str(username).lower().strip())
         username = str(username).lower().strip()
         if any(s.username == username for s in self.streamers):
             return None, f"'{username}' is already being tracked"
         if username == "ghost":
-            return None, "Twitch user 'ghost' does not exist"
+            return None, f"Twitch user '{username}' does not exist"
         self.streamers.append(FakeStreamer(username))
         self.original_streamers.append(0)
         return self.streamers[-1], None
@@ -58,6 +62,18 @@ class FakeMiner(object):
                     self.original_streamers.pop(i)
                 return True
         return False
+
+    def update_streamer_settings(self, username, update):
+        from TwitchChannelPointsMiner.TwitchChannelPointsMiner import (
+            TwitchChannelPointsMiner as MinerClass,
+        )
+
+        username = str(username).lower().strip()
+        if not any(s.username == username for s in self.streamers):
+            raise ValueError(f"'{username}' is not being tracked")
+        # Delegate to the REAL typed validator - this is what we want to test.
+        parsed = MinerClass._parse_streamer_settings(update)
+        self.settings_applied.append(parsed)
 
 
 def request(path, payload=None, expect_status=None):
@@ -75,15 +91,30 @@ def request(path, payload=None, expect_status=None):
     return status, body
 
 
+def _get(base, path):
+    resp = urllib.request.urlopen(base + path, timeout=10)
+    return resp.status, json.loads(resp.read().decode())
+
+
+def _post(base, path, payload):
+    req = urllib.request.Request(
+        base + path,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=10)
+        return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode())
+
+
 class StreamerManagementTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        # Other test modules (e.g. test_dashboard_auth) may export Twitch
-        # OAuth env vars; this suite must run with auth disabled regardless
-        # of import order. DashboardServer snapshots config in __init__,
-        # so clearing the vars just around construction is enough.
+        # Other suites may export OAuth env vars; force auth off here.
         with mock.patch.dict(os.environ):
-            for var in ("TWITCH_CLIENT_ID", "TWITCH_CLIENT_SECRET", "DASHBOARD_ALLOWED_USERS"):
+            for var in AUTH_VARS:
                 os.environ.pop(var, None)
             cls.httpd = DashboardServer(miner=None, host=HOST, port=PORT)
         cls.httpd.daemon = True
@@ -95,16 +126,13 @@ class StreamerManagementTests(unittest.TestCase):
         self.assertTrue(body["success"])
         _, cfg = request("/api/config", expect_status=200)
         self.assertIn("new_guy", cfg["streamers"])
-        # /api/all must include the new streamer too
         _, all_data = request("/api/all", expect_status=200)
         names = [s["username"] for s in all_data["streamers"]]
         self.assertIn("new_guy", names)
-        # duplicate rejected
         _, body = request("/api/streamers/add", {"username": "new_guy"}, 400)
         self.assertFalse(body["success"])
-        # remove works
         _, body = request("/api/streamers/remove", {"username": "new_guy"}, 200)
-        self.assertTrue(body["success"])
+        self.assertTrue(body["success"], body)
         _, cfg = request("/api/config")
         self.assertNotIn("new_guy", cfg["streamers"])
 
@@ -130,7 +158,7 @@ class StreamerManagementTests(unittest.TestCase):
     def test_05_live_miner_add_and_remove(self):
         miner = FakeMiner()
         with mock.patch.dict(os.environ):
-            for var in ("TWITCH_CLIENT_ID", "TWITCH_CLIENT_SECRET", "DASHBOARD_ALLOWED_USERS"):
+            for var in AUTH_VARS:
                 os.environ.pop(var, None)
             httpd = DashboardServer(miner=miner, host="127.0.0.1", port=PORT + 1)
         httpd.daemon = True
@@ -138,9 +166,6 @@ class StreamerManagementTests(unittest.TestCase):
         try:
             time.sleep(0.4)
             base = f"http://127.0.0.1:{PORT + 1}"
-            old_base = BASE
-            # temporarily point helper at the live-miner server
-            globals()["_live_base"] = base
 
             _, cfg = _get(base, "/api/config")
             self.assertEqual(cfg["streamers"], ["existing"])
@@ -149,10 +174,10 @@ class StreamerManagementTests(unittest.TestCase):
             self.assertTrue(body["success"])
 
             _, body = _post(base, "/api/streamers/add", {"username": "someone"})
-            self.assertFalse(body["success"])  # duplicate
+            self.assertEqual(body["success"], False)  # duplicate
 
             _, body = _post(base, "/api/streamers/remove", {"username": "SOMEONE"})
-            self.assertTrue(body["success"])
+            self.assertTrue(body["success"], body)
 
             _, cfg = _get(base, "/api/config")
             self.assertEqual(cfg["streamers"], ["existing"])
@@ -163,23 +188,132 @@ class StreamerManagementTests(unittest.TestCase):
                 inner.shutdown()
                 inner.server_close()
 
+    def test_06_settings_update_roundtrip_demo(self):
+        _, body = _post(
+            BASE,
+            "/api/streamers/settings",
+            {
+                "username": "demo_streamer",
+                "settings": {"bet": {"strategy": "HIGH_ODDS", "percentage": 7}},
+            },
+        )
+        self.assertTrue(body["success"], body)
+        _, streamers = request("/api/streamers", expect_status=200)
+        demo = next(s for s in streamers if s["username"] == "demo_streamer")
+        self.assertEqual(demo["settings"]["bet"]["strategy"], "HIGH_ODDS")
+        self.assertEqual(demo["settings"]["bet"]["percentage"], 7)
 
-def _get(base, path):
-    resp = urllib.request.urlopen(base + path, timeout=10)
-    return resp.status, json.loads(resp.read().decode())
+    def test_07_settings_validation_errors(self):
+        cases = [
+            {"bet": {"strategy": "YOLO"}},
+            {"bet": {"percentage": 500}},
+            {"chat": "SOMETIMES"},
+        ]
+        for settings in cases:
+            status, body = _post(
+                BASE,
+                "/api/streamers/settings",
+                {"username": "demo_streamer", "settings": settings},
+            )
+            self.assertEqual(status, 400, f"{settings}: {body}")
+            self.assertFalse(body["success"])
 
+    def test_08_settings_filter_condition_set_and_clear(self):
+        _, body = _post(
+            BASE,
+            "/api/streamers/settings",
+            {
+                "username": "second_channel",
+                "settings": {
+                    "bet": {
+                        "filter_condition": {
+                            "by": "TOTAL_POINTS",
+                            "where": "GTE",
+                            "value": 250,
+                        }
+                    }
+                },
+            },
+        )
+        self.assertTrue(body["success"], body)
+        _, streamers = request("/api/streamers")
+        second = next(s for s in streamers if s["username"] == "second_channel")
+        fc = second["settings"]["bet"]["filter_condition"]
+        self.assertEqual(fc["by"], "TOTAL_POINTS")
+        self.assertEqual(fc["where"], "GTE")
+        # clear it again
+        _, body = _post(
+            BASE,
+            "/api/streamers/settings",
+            {
+                "username": "second_channel",
+                "settings": {"bet": {"filter_condition": None}},
+            },
+        )
+        self.assertTrue(body["success"])
+        _, streamers = request("/api/streamers")
+        second = next(s for s in streamers if s["username"] == "second_channel")
+        self.assertIsNone(second["settings"]["bet"]["filter_condition"])
 
-def _post(base, path, payload):
-    req = urllib.request.Request(
-        base + path,
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        resp = urllib.request.urlopen(req, timeout=10)
-        return resp.status, json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read().decode())
+    def test_09_settings_unknown_streamer_rejected(self):
+        status, body = _post(
+            BASE,
+            "/api/streamers/settings",
+            {"username": "who_dis", "settings": {"chat": "ALWAYS"}},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("not being tracked", body["error"])
+
+    def test_10_live_miner_settings_via_real_validator(self):
+        miner = FakeMiner()
+        with mock.patch.dict(os.environ):
+            for var in AUTH_VARS:
+                os.environ.pop(var, None)
+            httpd = DashboardServer(miner=miner, host="127.0.0.1", port=PORT + 2)
+        httpd.daemon = True
+        httpd.start()
+        try:
+            time.sleep(0.4)
+            ok, err = httpd.update_streamer_settings(
+                "existing",
+                {
+                    "make_predictions": True,
+                    "chat": "ONLINE",
+                    "bet": {
+                        "strategy": "SMART_MONEY",
+                        "percentage": 9,
+                        "filter_condition": {
+                            "by": "ODDS_PERCENTAGE",
+                            "where": "GT",
+                            "value": 55,
+                        },
+                    },
+                },
+            )
+            self.assertTrue(ok, err)
+            applied = miner.settings_applied[-1]
+            self.assertEqual(applied["bet"]["strategy"].name, "SMART_MONEY")
+            self.assertEqual(applied["bet"]["percentage"], 9)
+            # OutcomeKeys values are lowercase strings - what Bet.skip() uses
+            from TwitchChannelPointsMiner.classes.entities.Bet import OutcomeKeys
+            self.assertEqual(
+                applied["bet"]["filter_condition"].by, OutcomeKeys.ODDS_PERCENTAGE
+            )
+
+            ok, err = httpd.update_streamer_settings(
+                "existing", {"bet": {"strategy": "NOPE"}}
+            )
+            self.assertFalse(ok)
+            self.assertIn("strategy", err)
+
+            ok, err = httpd.update_streamer_settings("ghost2", {"chat": "ONLINE"})
+            self.assertFalse(ok)
+            self.assertIn("not being tracked", err)
+        finally:
+            inner = getattr(httpd, "httpd", None)
+            if inner is not None:
+                inner.shutdown()
+                inner.server_close()
 
 
 if __name__ == "__main__":

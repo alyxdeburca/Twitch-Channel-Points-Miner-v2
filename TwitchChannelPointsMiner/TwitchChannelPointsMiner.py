@@ -21,6 +21,13 @@ from TwitchChannelPointsMiner.classes.entities.Streamer import (
 )
 from TwitchChannelPointsMiner.classes.Exceptions import StreamerDoesNotExistException
 from TwitchChannelPointsMiner.classes.Settings import FollowersOrder, Priority, Settings
+from TwitchChannelPointsMiner.classes.entities.Bet import (
+    Condition,
+    DelayMode,
+    FilterCondition,
+    OutcomeKeys,
+    Strategy,
+)
 from TwitchChannelPointsMiner.classes.Twitch import Twitch
 from TwitchChannelPointsMiner.classes.WebSocketsPool import WebSocketsPool
 from TwitchChannelPointsMiner.logger import LoggerSettings, configure_loggers
@@ -32,6 +39,21 @@ from TwitchChannelPointsMiner.utils import (
     internet_connection_available,
     set_default_settings,
 )
+
+# OutcomeKeys is a plain namespace (not an Enum): map names <-> values.
+_OUTCOME_KEYS_BY_NAME = {
+    name: getattr(OutcomeKeys, name)
+    for name in (
+        "PERCENTAGE_USERS",
+        "ODDS_PERCENTAGE",
+        "ODDS",
+        "TOP_POINTS",
+        "TOTAL_USERS",
+        "TOTAL_POINTS",
+    )
+}
+
+logger = logging.getLogger(__name__)
 
 # Suppress:
 #   - chardet.charsetprober - [feed]
@@ -45,8 +67,6 @@ logging.getLogger("chardet.charsetprober").setLevel(logging.ERROR)
 logging.getLogger("requests").setLevel(logging.ERROR)
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 logging.getLogger("irc.client").setLevel(logging.ERROR)
-
-logger = logging.getLogger(__name__)
 
 
 class TwitchChannelPointsMiner:
@@ -217,6 +237,177 @@ class TwitchChannelPointsMiner:
                 )
                 return True
         return False
+
+    @staticmethod
+    def _parse_streamer_settings(update: dict) -> dict:
+        """Validate a settings payload from the dashboard into typed values.
+
+        Raises ValueError with a user-readable message on any bad input.
+        Returns {field: value} ready to apply onto StreamerSettings/bet.
+        """
+        from TwitchChannelPointsMiner.classes.Chat import ChatPresence
+
+        if not isinstance(update, dict):
+            raise ValueError("settings payload must be an object")
+        parsed = {}
+
+        for flag in ("make_predictions", "follow_raid", "claim_drops", "watch_streak"):
+            if flag in update and update[flag] is not None:
+                parsed[flag] = bool(update[flag])
+
+        if "chat" in update and update["chat"] is not None:
+            chat = str(update["chat"]).upper()
+            try:
+                parsed["chat"] = ChatPresence[chat]
+            except KeyError:
+                raise ValueError(f"chat must be one of ALWAYS, NEVER, ONLINE, OFFLINE")
+
+        bet_update = update.get("bet") or {}
+        if not isinstance(bet_update, dict):
+            raise ValueError("bet must be an object")
+        bet = {}
+
+        if "strategy" in bet_update and bet_update["strategy"] is not None:
+            strategy = str(bet_update["strategy"]).upper()
+            try:
+                bet["strategy"] = Strategy[strategy]
+            except KeyError:
+                raise ValueError(
+                    "bet.strategy must be one of MOST_VOTED, HIGH_ODDS, PERCENTAGE, SMART_MONEY, SMART"
+                )
+
+        for field in ("percentage", "percentage_gap", "max_points", "minimum_points"):
+            if field in bet_update and bet_update[field] is not None:
+                try:
+                    value = int(bet_update[field])
+                except (TypeError, ValueError):
+                    raise ValueError(f"bet.{field} must be an integer")
+                limits = {
+                    "percentage": (1, 100),
+                    "percentage_gap": (0, 100),
+                    "max_points": (0, 10**9),
+                    "minimum_points": (0, 10**9),
+                }
+                low, high = limits[field]
+                if not low <= value <= high:
+                    raise ValueError(f"bet.{field} must be between {low} and {high}")
+                bet[field] = value
+
+        if "stealth_mode" in bet_update and bet_update["stealth_mode"] is not None:
+            bet["stealth_mode"] = bool(bet_update["stealth_mode"])
+
+        if "delay" in bet_update and bet_update["delay"] is not None:
+            try:
+                delay = float(bet_update["delay"])
+            except (TypeError, ValueError):
+                raise ValueError("bet.delay must be a number")
+            if not 0 <= delay <= 1200:
+                raise ValueError("bet.delay must be between 0 and 1200 seconds")
+            bet["delay"] = delay
+
+        if "delay_mode" in bet_update and bet_update["delay_mode"] is not None:
+            mode = str(bet_update["delay_mode"]).upper()
+            try:
+                bet["delay_mode"] = DelayMode[mode]
+            except KeyError:
+                raise ValueError("bet.delay_mode must be one of FROM_START, FROM_END, PERCENTAGE")
+
+        if "filter_condition" in bet_update:
+            fc = bet_update["filter_condition"]
+            if fc is None or (isinstance(fc, dict) and str(fc.get("by", "")).upper() == "NONE"):
+                bet["filter_condition"] = None
+            elif isinstance(fc, dict):
+                by = str(fc.get("by", "")).upper()
+                where = str(fc.get("where", "")).upper()
+                try:
+                    by_key = _OUTCOME_KEYS_BY_NAME[by]
+                except KeyError:
+                    raise ValueError(
+                        "filter_condition.by must be one of PERCENTAGE_USERS, ODDS_PERCENTAGE, ODDS, TOP_POINTS, TOTAL_USERS, TOTAL_POINTS"
+                    )
+                try:
+                    where_cond = Condition[where]
+                except KeyError:
+                    raise ValueError("filter_condition.where must be one of GT, LT, GTE, LTE")
+                try:
+                    value = float(fc.get("value"))
+                except (TypeError, ValueError):
+                    raise ValueError("filter_condition.value must be a number")
+                bet["filter_condition"] = FilterCondition(
+                    by=by_key, where=where_cond, value=value
+                )
+            else:
+                raise ValueError("filter_condition must be null or an object")
+
+        parsed["bet"] = bet
+        return parsed
+
+    def update_streamer_settings(self, username: str, update: dict):
+        """Change settings for one tracked streamer at runtime.
+
+        Handles side effects: IRC chat start/stop when `chat` changes,
+        prediction topic subscribe/unsubscribe when make_predictions flips.
+        Returns the updated Streamer or raises ValueError.
+        """
+        username = str(username).lower().strip()
+        target = next((s for s in self.streamers if s.username == username), None)
+        if target is None:
+            raise ValueError(f"'{username}' is not being tracked")
+
+        parsed = self._parse_streamer_settings(update)
+
+        old_chat = target.settings.chat
+        old_make_predictions = target.settings.make_predictions
+
+        for field, value in parsed.items():
+            if field == "bet":
+                for bet_field, bet_value in value.items():
+                    setattr(target.settings.bet, bet_field, bet_value)
+            else:
+                setattr(target.settings, field, value)
+
+        # Chat thread reconciliation
+        if "chat" in parsed:
+            new_chat = parsed["chat"]
+            try:
+                if new_chat == ChatPresence.NEVER and target.irc_chat is not None:
+                    target.leave_chat()
+                    target.irc_chat = None
+                elif new_chat != ChatPresence.NEVER and target.irc_chat is None:
+                    target.irc_chat = ThreadChat(
+                        self.username,
+                        self.twitch.twitch_login.get_auth_token(),
+                        target.username,
+                    )
+            except Exception as e:
+                logger.warning(f"Issue reconciling chat for {username}: {e}")
+
+        # Prediction topic reconciliation
+        if self.ws_pool is not None and "make_predictions" in parsed:
+            new_flag = parsed["make_predictions"]
+            if new_flag != old_make_predictions:
+                topic_type = "predictions-channel-v1"
+                try:
+                    if new_flag is True:
+                        self.ws_pool.submit(PubsubTopic(topic_type, streamer=target))
+                    else:
+                        for ws in self.ws_pool.ws:
+                            ws.topics = [
+                                t
+                                for t in ws.topics
+                                if not (
+                                    t.type == topic_type
+                                    and getattr(t, "streamer", None) is target
+                                )
+                            ]
+                except Exception as e:
+                    logger.warning(f"Issue updating prediction topics for {username}: {e}")
+
+        logger.info(
+            f"Settings updated for {username}",
+            extra={"emoji": ":wrench:"},
+        )
+        return target
 
     def mine(
         self,

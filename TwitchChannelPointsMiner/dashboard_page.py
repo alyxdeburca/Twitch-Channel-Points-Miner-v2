@@ -157,6 +157,38 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   #toast.ok { border-color:rgba(34,197,94,.5); color:var(--green); }
   #toast.err { border-color:rgba(239,68,68,.5); color:var(--red); }
+  .card-gear {
+    border:none; background:transparent; color:var(--dim); cursor:pointer;
+    font-size:14px; padding:2px 6px; border-radius:5px;
+  }
+  .card-gear:hover { color:var(--accent); background:rgba(169,112,255,.12); }
+  .modal .form-grid {
+    display:grid; grid-template-columns:1fr 1fr; gap:10px 14px;
+    max-height:60vh; overflow-y:auto; padding-right:4px;
+  }
+  .modal label.fld { display:flex; flex-direction:column; gap:4px; font-size:11px; color:var(--muted); }
+  .modal label.fld.full { grid-column:1 / -1; }
+  .modal label.fld input[type=number],
+  .modal label.fld select,
+  .modal label.fld input[type=text] {
+    padding:8px 10px; border-radius:7px; border:1px solid var(--border);
+    background:var(--panel2); color:var(--text); font-size:13px; outline:none;
+  }
+  .modal label.fld input:focus, .modal label.fld select:focus { border-color:var(--accent); }
+  .switch-row { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .switch { position:relative; width:34px; height:18px; flex:none; }
+  .switch input { opacity:0; width:0; height:0; }
+  .slider {
+    position:absolute; cursor:pointer; inset:0; background:#3a3a42; border-radius:999px; transition:.15s;
+  }
+  .slider:before {
+    content:""; position:absolute; height:14px; width:14px; left:2px; top:2px;
+    background:#fff; border-radius:50%; transition:.15s;
+  }
+  .switch input:checked + .slider { background:var(--green); }
+  .switch input:checked + .slider:before { transform:translateX(16px); }
+  .settings-sep { grid-column:1 / -1; margin-top:6px; font-size:10px; letter-spacing:1px;
+    text-transform:uppercase; color:var(--dim); border-bottom:1px solid var(--border); padding-bottom:4px; }
 
   footer { position: fixed; bottom: 0; left: 0; right: 0; text-align: center; padding: 6px;
     background: rgba(14,14,16,.85); backdrop-filter: blur(4px); color: var(--dim); font-size: 11px;
@@ -204,6 +236,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 </div>
+
+<div id="settings-backdrop" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.65); z-index:55; align-items:center; justify-content:center;">
+  <div class="modal" style="width:min(560px,94vw);">
+    <h3>Settings — <span id="st-name"></span></h3>
+    <p>Applied live to the running miner. Leave anything you don't want to change as-is.</p>
+    <div class="form-grid" id="settings-form"></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" id="cancel-settings">Cancel</button>
+      <button class="btn" id="save-settings">Save settings</button>
+    </div>
+  </div>
+</div>
+
 <div id="toast"></div>
 
 <footer><span id="upd">waiting for data…</span> · auto-refresh 3s</footer>
@@ -270,6 +315,7 @@ function renderAll(d) {
       <span class="dot ${s.online ? "on" : "off"}"></span>
       <a class="name" href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.username)}</a>
       <span class="online-tag ${s.online ? "live" : "off"}">${s.online ? "LIVE" : "OFFLINE"}</span>
+      <button class="card-gear" title="Settings for ${esc(s.username)}" data-settings="${esc(s.username)}">⚙</button>
       <button class="card-remove" title="Stop tracking ${esc(s.username)}" data-rm="${esc(s.username)}">✕</button>
     </div>
       <div><span class="pts">${short(s.channel_points)}</span>
@@ -326,6 +372,9 @@ function renderAll(d) {
     (d.status.demo ? " · demo data, no miner attached" : "");
 
   window.__editable = !!(d.config && d.config.editable);
+  window.__options = (d.config && d.config.options) || {};
+  window.__streamerIndex = {};
+  d.streamers.forEach((s) => { window.__streamerIndex[s.username] = s; });
 }
 
 // ---------- streamer management ---------- //
@@ -392,6 +441,106 @@ $("new-username").addEventListener("keydown", (e) => {
 document.addEventListener("click", (e) => {
   const rm = e.target.closest("[data-rm]");
   if (rm) removeStreamer(rm.dataset.rm);
+  const gear = e.target.closest("[data-settings]");
+  if (gear) {
+    const s = window.__streamerIndex && window.__streamerIndex[gear.dataset.settings];
+    if (s) openSettings(s);
+  }
+});
+
+// ---------- settings editor ---------- //
+function swRow(key, label, checked) {
+  return `<div class="fld full switch-row" style="border:1px solid var(--border); border-radius:8px; padding:8px 12px; background:var(--panel2);">
+    <span>${esc(label)}</span>
+    <label class="switch"><input type="checkbox" data-set="${key}" ${checked ? "checked" : ""}><span class="slider"></span></label>
+  </div>`;
+}
+function openSettings(s) {
+  const opts = (window.__options || {});
+  const b = (s.settings && s.settings.bet) || {};
+  const fc = b.filter_condition;
+  $("st-name").textContent = "@" + s.username;
+
+  const sel = (key, list, val) =>
+    `<select data-set="${key}">` + list.map((o) =>
+      `<option value="${o}" ${String(val).toUpperCase() === o ? "selected" : ""}>${o}</option>`
+    ).join("") + `</select>`;
+
+  $("settings-form").innerHTML = [
+    `<div class="settings-sep">Mining</div>`,
+    swRow("make_predictions", "Make predictions (bet)", s.settings.make_predictions),
+    swRow("follow_raid", "Follow raids", s.settings.follow_raid),
+    swRow("claim_drops", "Claim drops", s.settings.claim_drops),
+    swRow("watch_streak", "Watch streak priority", s.settings.watch_streak),
+    `<label class="fld">Chat presence${sel("chat", opts.chat || ["ALWAYS","NEVER","ONLINE","OFFLINE"], s.settings.chat || "NEVER")}</label>`,
+    `<div class="settings-sep">Betting</div>`,
+    `<label class="fld">Strategy${sel("strategy", opts.strategy || ["MOST_VOTED","HIGH_ODDS","PERCENTAGE","SMART_MONEY","SMART"], b.strategy || "SMART")}</label>`,
+    `<label class="fld">Bet % of points<input type="number" min="1" max="100" data-set="percentage" value="${b.percentage ?? 5}"></label>`,
+    `<label class="fld">SMART gap %<input type="number" min="0" max="100" data-set="percentage_gap" value="${b.percentage_gap ?? 20}"></label>`,
+    `<label class="fld">Max bet points<input type="number" min="0" data-set="max_points" value="${b.max_points ?? 50000}"></label>`,
+    `<label class="fld">Minimum points to bet<input type="number" min="0" data-set="minimum_points" value="${b.minimum_points ?? 0}"></label>`,
+    swRow("stealth_mode", "Stealth mode", b.stealth_mode),
+    `<label class="fld">Delay (seconds)<input type="number" min="0" max="1200" step="0.5" data-set="delay" value="${b.delay ?? 6}"></label>`,
+    `<label class="fld">Delay mode${sel("delay_mode", opts.delay_mode || ["FROM_START","FROM_END","PERCENTAGE"], b.delay_mode || "FROM_END")}</label>`,
+    `<div class="settings-sep">Filter condition (skip bets unless matched)</div>`,
+    `<label class="fld">Filter by${sel("filter_by", opts.filter_by || ["NONE","PERCENTAGE_USERS","ODDS_PERCENTAGE","ODDS","TOP_POINTS","TOTAL_USERS","TOTAL_POINTS"], fc ? fc.by : "NONE")}</label>`,
+    `<label class="fld">Condition${sel("filter_where", opts.filter_where || ["GT","LT","GTE","LTE"], fc ? fc.where : "LTE")}</label>`,
+    `<label class="fld">Value<input type="number" step="any" data-set="filter_value" value="${fc ? fc.value : 800}"></label>`,
+  ].join("");
+
+  $("settings-backdrop").style.display = "flex";
+}
+function closeSettings() { $("settings-backdrop").style.display = "none"; }
+$("cancel-settings").addEventListener("click", closeSettings);
+$("settings-backdrop").addEventListener("click", (e) => {
+  if (e.target === $("settings-backdrop")) closeSettings();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeSettings();
+});
+$("save-settings").addEventListener("click", async () => {
+  const name = $("st-name").textContent.replace(/^@/, "");
+  const get = (k) => document.querySelector(`#settings-form [data-set="${k}"]`);
+  const num = (k, def = null) => {
+    const el = get(k);
+    return el && el.value !== "" ? Number(el.value) : def;
+  };
+  const payload = {
+    username: name,
+    settings: {
+      make_predictions: get("make_predictions").checked,
+      follow_raid: get("follow_raid").checked,
+      claim_drops: get("claim_drops").checked,
+      watch_streak: get("watch_streak").checked,
+      chat: get("chat").value,
+      bet: {
+        strategy: get("strategy").value,
+        percentage: num("percentage"),
+        percentage_gap: num("percentage_gap"),
+        max_points: num("max_points"),
+        minimum_points: num("minimum_points"),
+        stealth_mode: get("stealth_mode").checked,
+        delay: num("delay"),
+        delay_mode: get("delay_mode").value,
+        filter_condition:
+          get("filter_by").value === "NONE"
+            ? null
+            : {
+                by: get("filter_by").value,
+                where: get("filter_where").value,
+                value: num("filter_value", 0),
+              },
+      },
+    },
+  };
+  try {
+    await postJSON("/api/streamers/settings", payload);
+    toast("Settings saved for @" + name, true);
+    closeSettings();
+    tick();
+  } catch (err) {
+    toast("Could not save settings: " + err.message, false);
+  }
 });
 
 setInterval(() => {
