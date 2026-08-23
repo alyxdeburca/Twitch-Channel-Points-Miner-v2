@@ -68,6 +68,8 @@ class Twitch(object):
         "device_id",
         "integrity_token",
         "integrity_expires",
+        "http_session",
+        "_session_primed",
     ]
 
     def __init__(self, username, user_agent):
@@ -82,6 +84,35 @@ class Twitch(object):
         self.device_id = None
         self.integrity_token = None
         self.integrity_expires = 0
+        # One browser-like session: cookies collected from twitch.tv are
+        # required for the integrity token to be honored on mutations.
+        self.http_session = requests.Session()
+        self.http_session.headers.update({"User-Agent": self.user_agent})
+        self._session_primed = False
+
+    def _prime_session(self):
+        """Visit twitch.tv once to collect device cookies (unique_id etc.).
+
+        An integrity token fetched without these cookies is issued in a
+        vacuum and still fails the check on protected mutations."""
+        if self._session_primed:
+            return
+        try:
+            self.http_session.get(
+                "https://www.twitch.tv/",
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+                timeout=15,
+            )
+            logger.debug(
+                f"Session primed with cookies: {list(self.http_session.cookies.keys())}"
+            )
+        except requests.RequestException as e:
+            logger.debug(f"Could not prime session: {e}")
+        finally:
+            self._session_primed = True
 
     def _load_device_id(self):
         """Stable per-install device id (X-Device-Id), created once."""
@@ -106,16 +137,19 @@ class Twitch(object):
     def refresh_integrity_token(self):
         """Fetch a Client-Integrity token from twitch.tv.
 
-        Mirrors what the web player does before protected mutations.
-        Returns the token or None on failure."""
+        Mirrors what the web player does before protected mutations:
+        POST from within a session that has already visited twitch.tv
+        (device cookies), with Origin/Referer set."""
+        self._prime_session()
         headers = {
             "Authorization": f"OAuth {self.twitch_login.get_auth_token()}",
             "Client-Id": CLIENT_ID,
-            "User-Agent": self.user_agent,
+            "Origin": "https://www.twitch.tv",
+            "Referer": "https://www.twitch.tv/",
             "X-Device-Id": self._load_device_id(),
         }
         try:
-            response = requests.post(
+            response = self.http_session.post(
                 "https://gql.twitch.tv/integrity",
                 headers=headers,
                 timeout=15,
@@ -403,15 +437,18 @@ class Twitch(object):
 
     def post_gql_request(self, json_data):
         def _post(extra_headers=None):
-            return requests.post(
-                GQLOperations.url,
-                json=json_data,
-                headers={
-                    "Authorization": f"OAuth {self.twitch_login.get_auth_token()}",
-                    "Client-Id": CLIENT_ID,
-                    "User-Agent": self.user_agent,
-                    **(extra_headers or {}),
-                },
+            # Route everything through the primed session so twitch.tv
+            # device cookies ride along, like a real browser tab.
+            self._prime_session()
+            headers = {
+                "Authorization": f"OAuth {self.twitch_login.get_auth_token()}",
+                "Client-Id": CLIENT_ID,
+                "Origin": "https://www.twitch.tv",
+                "Referer": "https://www.twitch.tv/",
+                **(extra_headers or {}),
+            }
+            return self.http_session.post(
+                GQLOperations.url, json=json_data, headers=headers, timeout=30
             )
 
         try:
@@ -439,10 +476,17 @@ class Twitch(object):
                 self.integrity_expires = 0
                 self.refresh_integrity_token()
                 if self.integrity_token:
+                    # Force one full retry cycle with the fresh token; if it
+                    # still fails, drop the headers entirely (proven bare path)
                     response = _post(self._integrity_headers())
                     logger.debug(
                         f"Retry Data: {json_data}, Status code: {response.status_code}, Content: {response.text}"
                     )
+                if response.status_code == 200 and _integrity_failed(response):
+                    logger.info("Still rejected - falling back to bare request")
+                    self.integrity_token = None
+                    self.integrity_expires = time.time() + 300
+                    response = _post({})
 
             return response.json()
         except requests.exceptions.RequestException as e:

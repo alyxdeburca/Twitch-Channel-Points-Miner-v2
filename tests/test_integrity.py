@@ -23,11 +23,6 @@ class FakeResp(object):
 
 
 def make_twitch(tmpdir):
-    with mock.patch(
-        "TwitchChannelPointsMiner.classes.Twitch.Path"
-    ) as fake_path:
-        fake_path.return_value = None  # not used when cookies dir patched
-        # Simpler: bypass __init__ filesystem work
     twitch = Twitch.__new__(Twitch)
     twitch.cookies_file = "unused.pkl"
     twitch.user_agent = "agent/1.0"
@@ -37,6 +32,10 @@ def make_twitch(tmpdir):
     twitch.integrity_expires = 0
     twitch.twitch_login = mock.MagicMock()
     twitch.twitch_login.get_auth_token.return_value = "tok"
+    import requests
+
+    twitch.http_session = requests.Session()
+    twitch._session_primed = True  # never hit the network in unit tests
     return twitch
 
 
@@ -45,8 +44,9 @@ class IntegrityTests(unittest.TestCase):
         self.twitch = make_twitch("/tmp")
 
     def test_integrity_headers_fetch_and_cache(self):
-        with mock.patch(
-            "TwitchChannelPointsMiner.classes.Twitch.requests.post",
+        with mock.patch.object(
+            self.twitch.http_session,
+            "post",
             return_value=FakeResp(200, {"token": "abc", "expiration": 1800}),
         ) as mock_post:
             headers = self.twitch._integrity_headers()
@@ -55,8 +55,8 @@ class IntegrityTests(unittest.TestCase):
         self.assertEqual(headers.get("Client-Integrity"), "abc")
         self.assertIn("X-Device-Id", headers)
         # Second call must NOT re-fetch (cached by TTL)
-        with mock.patch(
-            "TwitchChannelPointsMiner.classes.Twitch.requests.post"
+        with mock.patch.object(
+            self.twitch.http_session, "post"
         ) as mock_post:
             headers = self.twitch._integrity_headers()
             mock_post.assert_not_called()
@@ -65,8 +65,9 @@ class IntegrityTests(unittest.TestCase):
     def test_expired_token_refetched(self):
         self.twitch.integrity_token = "old"
         self.twitch.integrity_expires = 0  # expired
-        with mock.patch(
-            "TwitchChannelPointsMiner.classes.Twitch.requests.post",
+        with mock.patch.object(
+            self.twitch.http_session,
+            "post",
             return_value=FakeResp(200, {"token": "new", "expiration": 1800}),
         ):
             headers = self.twitch._integrity_headers()
@@ -76,15 +77,16 @@ class IntegrityTests(unittest.TestCase):
         """Regression: a lone X-Device-Id without a token made Twitch gate
         ordinary queries ('user not found' on valid channels). When the
         token is unavailable, send NO integrity headers at all."""
-        with mock.patch(
-            "TwitchChannelPointsMiner.classes.Twitch.requests.post",
+        with mock.patch.object(
+            self.twitch.http_session,
+            "post",
             return_value=FakeResp(403),
         ):
             headers = self.twitch._integrity_headers()
         self.assertEqual(headers, {})
         # Within negative-cache window: no refetch attempt, still bare
-        with mock.patch(
-            "TwitchChannelPointsMiner.classes.Twitch.requests.post"
+        with mock.patch.object(
+            self.twitch.http_session, "post"
         ) as mock_post:
             self.assertEqual(self.twitch._integrity_headers(), {})
             mock_post.assert_not_called()
@@ -117,9 +119,8 @@ class IntegrityTests(unittest.TestCase):
             Twitch,
             "_integrity_headers",
             side_effect=lambda *a, **k: header_states[min(len(gql_calls), 1)],
-        ), mock.patch(
-            "TwitchChannelPointsMiner.classes.Twitch.requests.post",
-            side_effect=fake_post,
+        ), mock.patch.object(
+            self.twitch.http_session, "post", side_effect=fake_post
         ), mock.patch.object(
             Twitch,
             "refresh_integrity_token",
