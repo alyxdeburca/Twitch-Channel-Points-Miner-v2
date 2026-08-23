@@ -59,7 +59,15 @@ def _safe_resync(twitch, streamer):
 
 
 class Twitch(object):
-    __slots__ = ["cookies_file", "user_agent", "twitch_login", "running"]
+    __slots__ = [
+        "cookies_file",
+        "user_agent",
+        "twitch_login",
+        "running",
+        "device_id",
+        "integrity_token",
+        "integrity_expires",
+    ]
 
     def __init__(self, username, user_agent):
         cookies_path = os.path.join(Path().absolute(), "cookies")
@@ -68,6 +76,81 @@ class Twitch(object):
         self.user_agent = user_agent
         self.twitch_login = TwitchLogin(CLIENT_ID, username, self.user_agent)
         self.running = True
+        # Twitch "Client-Integrity" state: sensitive mutations (bonus claims,
+        # predictions) are rejected with IntegrityCheckFailed without these.
+        self.device_id = None
+        self.integrity_token = None
+        self.integrity_expires = 0
+
+    def _load_device_id(self):
+        """Stable per-install device id (X-Device-Id), created once."""
+        if self.device_id:
+            return self.device_id
+        device_file = os.path.join(Path().absolute(), ".dashboard", "device_id")
+        try:
+            if os.path.isfile(device_file):
+                with open(device_file, "r", encoding="utf-8") as fh:
+                    self.device_id = fh.read().strip() or None
+            if not self.device_id:
+                import uuid as _uuid
+
+                self.device_id = str(_uuid.uuid4())
+                Path(os.path.dirname(device_file)).mkdir(parents=True, exist_ok=True)
+                with open(device_file, "w", encoding="utf-8") as fh:
+                    fh.write(self.device_id)
+        except OSError:
+            self.device_id = token_hex(16)
+        return self.device_id
+
+    def refresh_integrity_token(self):
+        """Fetch a Client-Integrity token from twitch.tv.
+
+        Mirrors what the web player does before protected mutations.
+        Returns the token or None on failure."""
+        headers = {
+            "Authorization": f"OAuth {self.twitch_login.get_auth_token()}",
+            "Client-Id": CLIENT_ID,
+            "User-Agent": self.user_agent,
+            "X-Device-Id": self._load_device_id(),
+        }
+        try:
+            response = requests.get(
+                "https://gql.twitch.tv/integrity", headers=headers, timeout=15
+            )
+            if response.status_code == 200:
+                payload = response.json()
+                self.integrity_token = payload.get("token") or None
+                # TTL is seconds; refresh a bit early
+                self.integrity_expires = time.time() + int(
+                    payload.get("expiration", 1800) or 1800
+                ) - 120
+                logger.debug("Refreshed client-integrity token")
+            else:
+                logger.warning(
+                    f"Integrity endpoint returned HTTP {response.status_code}"
+                )
+                # Negative cache: don't hammer the endpoint on every call
+                self.integrity_expires = time.time() + 60
+        except requests.RequestException as e:
+            logger.warning(f"Could not fetch integrity token: {e}")
+            self.integrity_expires = time.time() + 60
+        return self.integrity_token
+
+    def _integrity_headers(self):
+        """X-Device-Id + a fresh-enough Client-Integrity token, or {}.
+
+        The negative-cache window (integrity_expires in the future with no
+        token) suppresses repeated fetch attempts after failures."""
+        headers = {"X-Device-Id": self._load_device_id()}
+        now = time.time()
+        if self.integrity_token is None and now < self.integrity_expires:
+            # Recently failed to fetch - don't hammer the endpoint
+            return headers
+        if not self.integrity_token or now >= self.integrity_expires:
+            self.refresh_integrity_token()
+        if self.integrity_token:
+            headers["Client-Integrity"] = self.integrity_token
+        return headers
 
     def login(self):
         if os.path.isfile(self.cookies_file) is False:
@@ -300,24 +383,54 @@ class Twitch(object):
             self.__chuncked_sleep(random_sleep * 60, chunk_size=chunk_size)
 
     def post_gql_request(self, json_data):
-        try:
-            response = requests.post(
+        def _post(extra_headers=None):
+            return requests.post(
                 GQLOperations.url,
                 json=json_data,
                 headers={
                     "Authorization": f"OAuth {self.twitch_login.get_auth_token()}",
                     "Client-Id": CLIENT_ID,
                     "User-Agent": self.user_agent,
+                    **(extra_headers or {}),
                 },
             )
+
+        try:
+            # Attach device id + client-integrity up front: Twitch rejects
+            # sensitive mutations (claims, predictions) otherwise.
+            response = _post(self._integrity_headers())
             logger.debug(
                 f"Data: {json_data}, Status code: {response.status_code}, Content: {response.text}"
             )
+
+            # One automatic retry with a freshly minted integrity token
+            def _integrity_failed(resp):
+                try:
+                    return any(
+                        (e or {}).get("extensions", {}).get("code")
+                        == "IntegrityCheckFailed"
+                        for e in resp.json().get("errors", [])
+                    )
+                except Exception:
+                    return False
+
+            if response.status_code == 200 and _integrity_failed(response):
+                logger.info("Integrity check failed - refreshing token and retrying once")
+                self.integrity_token = None
+                self.integrity_expires = 0
+                self.refresh_integrity_token()
+                if self.integrity_token:
+                    response = _post(self._integrity_headers())
+                    logger.debug(
+                        f"Retry Data: {json_data}, Status code: {response.status_code}, Content: {response.text}"
+                    )
+
             return response.json()
         except requests.exceptions.RequestException as e:
-            logger.error(
-                f"Error with GQLOperations ({json_data['operationName']}): {e}"
+            operation = (
+                json_data.get("operationName") if isinstance(json_data, dict) else "?"
             )
+            logger.error(f"Error with GQLOperations ({operation}): {e}")
             return {}
 
     def send_minute_watched_events(self, streamers, priority, chunk_size=3):
