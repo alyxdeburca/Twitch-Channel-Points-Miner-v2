@@ -25,7 +25,7 @@ from TwitchChannelPointsMiner.classes.entities.Bet import (
     Condition,
     DelayMode,
     FilterCondition,
-    OutcomeKeys,
+    OUTCOME_KEYS_BY_NAME,
     Strategy,
 )
 from TwitchChannelPointsMiner.classes.Twitch import Twitch
@@ -39,19 +39,6 @@ from TwitchChannelPointsMiner.utils import (
     internet_connection_available,
     set_default_settings,
 )
-
-# OutcomeKeys is a plain namespace (not an Enum): map names <-> values.
-_OUTCOME_KEYS_BY_NAME = {
-    name: getattr(OutcomeKeys, name)
-    for name in (
-        "PERCENTAGE_USERS",
-        "ODDS_PERCENTAGE",
-        "ODDS",
-        "TOP_POINTS",
-        "TOTAL_USERS",
-        "TOTAL_POINTS",
-    )
-}
 
 logger = logging.getLogger(__name__)
 
@@ -320,7 +307,7 @@ class TwitchChannelPointsMiner:
                 by = str(fc.get("by", "")).upper()
                 where = str(fc.get("where", "")).upper()
                 try:
-                    by_key = _OUTCOME_KEYS_BY_NAME[by]
+                    by_key = OUTCOME_KEYS_BY_NAME[by]
                 except KeyError:
                     raise ValueError(
                         "filter_condition.by must be one of PERCENTAGE_USERS, ODDS_PERCENTAGE, ODDS, TOP_POINTS, TOTAL_USERS, TOTAL_POINTS"

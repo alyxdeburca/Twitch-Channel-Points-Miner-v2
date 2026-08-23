@@ -316,5 +316,63 @@ class StreamerManagementTests(unittest.TestCase):
                 inner.server_close()
 
 
+    def test_11_live_miner_state_serialization_regression(self):
+        """Regression: /api/streamers on a LIVE miner crashed with NameError
+        (_OUTCOME_KEYS_BY_NAME) because the demo path never exercised the
+        real-settings serialization branch."""
+        from TwitchChannelPointsMiner.classes.entities.Bet import (
+            BetSettings,
+            Condition,
+            FilterCondition,
+            OutcomeKeys,
+            Strategy,
+        )
+        from TwitchChannelPointsMiner.classes.entities.Streamer import (
+            Streamer,
+            StreamerSettings,
+        )
+
+        miner = FakeMiner()
+        real = Streamer("real_channel")
+        real.settings = StreamerSettings(make_predictions=True)
+        real.settings.default()
+        real.settings.bet = BetSettings(
+            strategy=Strategy.SMART,
+            percentage=5,
+            stealth_mode=True,
+            filter_condition=FilterCondition(
+                by=OutcomeKeys.TOTAL_USERS, where=Condition.LTE, value=800
+            ),
+        )
+        real.settings.bet.default()
+        miner.streamers = [real]
+        miner.original_streamers = [0]
+
+        with mock.patch.dict(os.environ):
+            for var in AUTH_VARS:
+                os.environ.pop(var, None)
+            httpd = DashboardServer(miner=miner, host="127.0.0.1", port=PORT + 3)
+        httpd.daemon = True
+        httpd.start()
+        try:
+            time.sleep(1.0)
+            status, streamers = _get(f"http://127.0.0.1:{PORT + 3}", "/api/streamers")
+            self.assertEqual(status, 200)
+            entry = next(s for s in streamers if s["username"] == "real_channel")
+            bet = entry["settings"]["bet"]
+            self.assertEqual(bet["strategy"], "SMART")
+            self.assertEqual(bet["filter_condition"]["by"], "TOTAL_USERS")
+            self.assertEqual(bet["filter_condition"]["where"], "LTE")
+            self.assertEqual(bet["filter_condition"]["value"], 800)
+            # full payload endpoint must work too (this is what the UI polls)
+            status, _ = _get(f"http://127.0.0.1:{PORT + 3}", "/api/all")
+            self.assertEqual(status, 200)
+        finally:
+            inner = getattr(httpd, "httpd", None)
+            if inner is not None:
+                inner.shutdown()
+                inner.server_close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

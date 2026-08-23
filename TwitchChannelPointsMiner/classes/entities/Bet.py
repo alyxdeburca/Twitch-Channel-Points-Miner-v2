@@ -42,6 +42,22 @@ class OutcomeKeys(object):
     DECISION_POINTS = "decision_points"
 
 
+# Human-readable name -> key value, for API/UI serialization.
+# Defined here (next to OutcomeKeys) so any module can import it without
+# circular-import problems.
+OUTCOME_KEYS_BY_NAME = {
+    name: getattr(OutcomeKeys, name)
+    for name in (
+        "PERCENTAGE_USERS",
+        "ODDS_PERCENTAGE",
+        "ODDS",
+        "TOP_POINTS",
+        "TOTAL_USERS",
+        "TOTAL_POINTS",
+    )
+}
+
+
 class DelayMode(Enum):
     FROM_START = auto()
     FROM_END = auto()

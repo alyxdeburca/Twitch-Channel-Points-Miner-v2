@@ -19,6 +19,7 @@ from TwitchChannelPointsMiner.dashboard_auth import (
     SessionStore,
     TwitchAuth,
 )
+from TwitchChannelPointsMiner.classes.entities.Bet import OUTCOME_KEYS_BY_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -272,7 +273,7 @@ class StateProvider(object):
             settings_obj = getattr(s, "settings", None)
             bet_obj = getattr(settings_obj, "bet", None)
             filter_obj = getattr(bet_obj, "filter_condition", None)
-            by_name = {v: k for k, v in _OUTCOME_KEYS_BY_NAME.items()}
+            by_name = {v: k for k, v in OUTCOME_KEYS_BY_NAME.items()}
             settings = {
                 "make_predictions": bool(_safe(lambda: settings_obj.make_predictions)),
                 "follow_raid": bool(_safe(lambda: settings_obj.follow_raid)),
@@ -294,7 +295,7 @@ class StateProvider(object):
                         "by": by_name.get(
                             _safe(lambda: filter_obj.by), "TOTAL_USERS"
                         ),
-                        "where": str(_safe(lambda: filter_obj.where), "LTE"),
+                        "where": _safe(lambda: str(filter_obj.where)) or "LTE",
                         "value": _safe(lambda: filter_obj.value, 0),
                     },
                 },
