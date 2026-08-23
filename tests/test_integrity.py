@@ -36,6 +36,7 @@ def make_twitch(tmpdir):
 
     twitch.http_session = requests.Session()
     twitch._session_primed = True  # never hit the network in unit tests
+    twitch.browser_integrity = None  # browser path off in unit tests
     return twitch
 
 

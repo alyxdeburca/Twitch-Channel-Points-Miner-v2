@@ -70,6 +70,7 @@ class Twitch(object):
         "integrity_expires",
         "http_session",
         "_session_primed",
+        "browser_integrity",
     ]
 
     def __init__(self, username, user_agent):
@@ -89,6 +90,28 @@ class Twitch(object):
         self.http_session = requests.Session()
         self.http_session.headers.update({"User-Agent": self.user_agent})
         self._session_primed = False
+        # OPTIONAL headless-browser integrity tokens - strictly opt-in via
+        # DASHBOARD_BROWSER_INTEGRITY=1. Nothing spawns unless you ask.
+        self.browser_integrity = None
+        if os.environ.get("DASHBOARD_BROWSER_INTEGRITY", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            try:
+                from TwitchChannelPointsMiner.classes.BrowserIntegrity import (
+                    BrowserIntegrity,
+                )
+
+                self.browser_integrity = BrowserIntegrity(
+                    auth_token_provider=lambda: self.twitch_login.get_auth_token(),
+                    data_dir=os.path.join(
+                        Path().absolute(), ".dashboard", "playwright"
+                    ),
+                )
+                logger.info("Browser-based integrity tokens ENABLED (opt-in)")
+            except Exception as e:
+                logger.warning(f"Browser integrity unavailable: {e}")
 
     def _prime_session(self):
         """Visit twitch.tv once to collect device cookies (unique_id etc.).
@@ -185,11 +208,27 @@ class Twitch(object):
     def _integrity_headers(self):
         """Client-Integrity + X-Device-Id headers, or {} when unavailable.
 
-        Important: send BOTH together or NEITHER. A lone X-Device-Id
-        without an integrity token makes Twitch apply stricter gating to
-        ordinary queries (observed as 'user not found' on valid channels).
-        The negative-cache window suppresses repeated fetch attempts."""
+        Order of preference:
+        1. Headless-browser token (opt-in via DASHBOARD_BROWSER_INTEGRITY=1)
+           - trusted by Twitch on protected mutations
+        2. HTTP-fetched token - works for some accounts/regions
+        3. Nothing (bare request) - never send a lone device id
+        """
         now = time.time()
+
+        # 1) Browser-minted token (only if user enabled it)
+        if self.browser_integrity is not None:
+            try:
+                token = self.browser_integrity.get_token()
+                if token:
+                    return {
+                        "X-Device-Id": self._load_device_id(),
+                        "Client-Integrity": token,
+                    }
+            except Exception as e:
+                logger.warning(f"Browser integrity failed: {e}")
+
+        # 2) HTTP-fetched token
         if self.integrity_token is None and now < self.integrity_expires:
             return {}  # recently failed to fetch - fall back to bare headers
         if not self.integrity_token or now >= self.integrity_expires:
