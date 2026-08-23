@@ -157,11 +157,20 @@ class Twitch(object):
             if response.status_code == 200:
                 payload = response.json()
                 self.integrity_token = payload.get("token") or None
-                # TTL is seconds; refresh a bit early
-                self.integrity_expires = time.time() + int(
-                    payload.get("expiration", 1800) or 1800
-                ) - 120
-                logger.debug("Refreshed client-integrity token")
+                # NOTE: 'expiration' is an ABSOLUTE unix epoch in
+                # MILLISECONDS (observed ~1.79e12), not a relative TTL.
+                expires_ms = int(payload.get("expiration") or 0)
+                if expires_ms > 10_000_000_000:  # epoch-ms sanity bound
+                    self.integrity_expires = expires_ms / 1000 - 120
+                else:
+                    # Fallback if Twitch ever reverts to a relative value
+                    self.integrity_expires = time.time() + max(
+                        60, min(int(payload.get("expiration") or 1800), 3600)
+                    ) - 120
+                logger.debug(
+                    f"Refreshed client-integrity token (valid for "
+                    f"{int(self.integrity_expires - time.time())}s)"
+                )
             else:
                 logger.warning(
                     f"Integrity endpoint returned HTTP {response.status_code}"
@@ -778,6 +787,9 @@ class Twitch(object):
         detail = ""
         if not isinstance(response, dict) or response == {}:
             detail = "no response from Twitch"
+        elif response.get("error"):
+            # e.g. {"error": "Unauthorized", "status": 401}
+            detail = f"request rejected: {response.get('error')} ({response.get('status', '?')})"
         else:
             claim_error = (
                 ((response.get("data") or {}).get("claimCommunityPoints") or {}).get(
