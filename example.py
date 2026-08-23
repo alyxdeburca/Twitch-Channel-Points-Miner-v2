@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import logging
+import os
 from colorama import Fore
 from TwitchChannelPointsMiner import TwitchChannelPointsMiner
 from TwitchChannelPointsMiner.logger import LoggerSettings, ColorPalette
@@ -13,7 +14,14 @@ from TwitchChannelPointsMiner.classes.entities.Streamer import Streamer, Streame
 
 twitch_miner = TwitchChannelPointsMiner(
     username="your-twitch-username",
-    password="write-your-secure-psw",           # If no password will be provided, the script will ask interactively
+    # Leave this as None (recommended): you'll be prompted securely on the
+    # first run only - the session is then cached in cookies/<username>.pkl
+    # and every later run logs in automatically. If Twitch answers with a
+    # CAPTCHA challenge, the miner falls back to importing your twitch.tv
+    # login from your regular browser (no password needed at all).
+    # You can also provide it via environment variable, e.g.
+    #   export TWITCH_PASSWORD="..." && python example.py
+    password=os.environ.get("TWITCH_PASSWORD"),
     claim_drops_startup=False,                  # If you want to auto claim all drops from Twitch inventory on the startup
     priority=[                                  # Custom priority in this case for example:
         Priority.STREAK,                        # - We want first of all to catch all watch streak from all streamers

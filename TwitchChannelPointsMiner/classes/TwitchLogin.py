@@ -149,14 +149,32 @@ class TwitchLogin(object):
 
     def send_login_request(self, json_data):
         response = self.session.post("https://passport.twitch.tv/login", json=json_data)
-        return response.json()
+        try:
+            return response.json()
+        except ValueError:  # requests.exceptions.JSONDecodeError subclasses ValueError
+            # Twitch frequently answers console-style logins with a CAPTCHA
+            # challenge (HTML/empty body) instead of JSON. Report it as
+            # error_code 1000 so login_flow() falls back to the
+            # browser-cookie login flow instead of crashing.
+            logger.warning(
+                f"Login endpoint returned a non-JSON response (HTTP {response.status_code}). "
+                "Twitch is requiring CAPTCHA/interactive login - switching to the browser cookie flow."
+            )
+            return {"error_code": 1000}
 
     def login_flow_backup(self):
         """Backup OAuth login flow in case manual captcha solving is required"""
         browser = input(
-            "What browser do you use? Chrome (1), Firefox (2), Other (3): "
+            "What browser do you use? Chrome (1), Firefox (2), Other/any installed (3): "
         ).strip()
-        if browser not in ("1", "2"):
+        twitch_domain = ".twitch.tv"
+        if browser == "1":  # chrome
+            cookie_jar = browser_cookie3.chrome(domain_name=twitch_domain)
+        elif browser == "2":
+            cookie_jar = browser_cookie3.firefox(domain_name=twitch_domain)
+        elif browser == "3":
+            cookie_jar = browser_cookie3.load(domain_name=twitch_domain)
+        else:
             logger.info("Your browser is unsupported, sorry.")
             return None
 
@@ -164,13 +182,11 @@ class TwitchLogin(object):
             "Please login inside your browser of choice (NOT incognito mode) and press Enter..."
         )
         logger.info("Loading cookies saved on your computer...")
-        twitch_domain = ".twitch.tv"
-        if browser == "1":  # chrome
-            cookie_jar = browser_cookie3.chrome(domain_name=twitch_domain)
-        else:
-            cookie_jar = browser_cookie3.firefox(domain_name=twitch_domain)
         cookies_dict = requests.utils.dict_from_cookiejar(cookie_jar)
-        self.username = cookies_dict.get("login")
+        # Only override the configured username if the browser told us one,
+        # otherwise check_login() would later query GQL with channelLogin=None.
+        if cookies_dict.get("login"):
+            self.username = cookies_dict["login"]
         return cookies_dict.get("auth-token")
 
     def check_login(self):
