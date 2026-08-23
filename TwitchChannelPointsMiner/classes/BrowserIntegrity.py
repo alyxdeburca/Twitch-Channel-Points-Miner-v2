@@ -26,15 +26,26 @@ class BrowserUnavailable(Exception):
 class BrowserIntegrity(object):
     """Lazily-started headless Chromium that returns integrity tokens."""
 
-    def __init__(self, auth_token, data_dir):
+    def __init__(self, auth_token=None, data_dir=None, auth_token_provider=None):
+        # Either a static token or (preferably) a callable returning the
+        # current token - the miner's cookie file can be renamed/rotated.
         self.auth_token = auth_token
-        self.data_dir = str(data_dir)
+        self._auth_token_provider = auth_token_provider
+        self.data_dir = str(data_dir) if data_dir else None
         self._lock = threading.Lock()
         self._playwright = None
         self._context = None
         self._page = None
         self.token = None
         self.expires = 0
+
+    def _current_auth_token(self):
+        if self._auth_token_provider is not None:
+            try:
+                return self._auth_token_provider()
+            except Exception:
+                return None
+        return self.auth_token
 
     # ------------------------------------------------------------------ #
     def _ensure_browser(self):
@@ -57,12 +68,13 @@ class BrowserIntegrity(object):
                 headless=True,
                 args=["--disable-blink-features=AutomationControlled"],
             )
-            if self.auth_token:
+            auth_token = self._current_auth_token()
+            if auth_token:
                 self._context.add_cookies(
                     [
                         {
                             "name": "auth-token",
-                            "value": self.auth_token,
+                            "value": auth_token,
                             "domain": ".twitch.tv",
                             "path": "/",
                         }

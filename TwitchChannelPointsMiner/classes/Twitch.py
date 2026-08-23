@@ -71,6 +71,7 @@ class Twitch(object):
         "http_session",
         "_session_primed",
         "browser_integrity",
+        "integrity_source",
     ]
 
     def __init__(self, username, user_agent):
@@ -90,15 +91,21 @@ class Twitch(object):
         self.http_session = requests.Session()
         self.http_session.headers.update({"User-Agent": self.user_agent})
         self._session_primed = False
-        # OPTIONAL headless-browser integrity tokens - strictly opt-in via
-        # DASHBOARD_BROWSER_INTEGRITY=1. Nothing spawns unless you ask.
+        # Headless-browser integrity tokens: enabled AUTOMATICALLY when the
+        # optional playwright dependency is present (Twitch rejects tokens
+        # minted outside a real browser). Disable explicitly with
+        # DASHBOARD_BROWSER_INTEGRITY=0.
         self.browser_integrity = None
-        if os.environ.get("DASHBOARD_BROWSER_INTEGRITY", "").lower() in (
-            "1",
-            "true",
-            "yes",
-        ):
+        flag = os.environ.get("DASHBOARD_BROWSER_INTEGRITY", "").strip().lower()
+        disabled = flag in ("0", "false", "no", "off")
+        if disabled:
+            logger.info("Browser-based integrity tokens DISABLED (explicit)")
+        else:
             try:
+                import importlib.util
+
+                if importlib.util.find_spec("playwright") is None:
+                    raise ImportError("playwright is not installed")
                 from TwitchChannelPointsMiner.classes.BrowserIntegrity import (
                     BrowserIntegrity,
                 )
@@ -109,9 +116,20 @@ class Twitch(object):
                         Path().absolute(), ".dashboard", "playwright"
                     ),
                 )
-                logger.info("Browser-based integrity tokens ENABLED (opt-in)")
+                logger.info(
+                    "Browser-based integrity tokens ENABLED "
+                    "(Chromium will launch on first protected mutation)"
+                )
+            except ImportError as e:
+                logger.info(
+                    f"Browser integrity unavailable ({e}) - using HTTP tokens only. "
+                    "Bonus claims may be rejected by Twitch. To enable: "
+                    "pip install playwright && python -m playwright install chromium"
+                )
             except Exception as e:
-                logger.warning(f"Browser integrity unavailable: {e}")
+                logger.warning(f"Browser integrity init failed: {e}")
+        # Which source supplied the last integrity payload (for diagnostics)
+        self.integrity_source = "http"
 
     def _prime_session(self):
         """Visit twitch.tv once to collect device cookies (unique_id etc.).
