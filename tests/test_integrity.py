@@ -46,43 +46,48 @@ class IntegrityTests(unittest.TestCase):
 
     def test_integrity_headers_fetch_and_cache(self):
         with mock.patch(
-            "TwitchChannelPointsMiner.classes.Twitch.requests.get",
+            "TwitchChannelPointsMiner.classes.Twitch.requests.post",
             return_value=FakeResp(200, {"token": "abc", "expiration": 1800}),
-        ):
+        ) as mock_post:
             headers = self.twitch._integrity_headers()
+            # /integrity must be POST (GET returns 405)
+            self.assertEqual(mock_post.call_args[0][0], "https://gql.twitch.tv/integrity")
         self.assertEqual(headers.get("Client-Integrity"), "abc")
         self.assertIn("X-Device-Id", headers)
         # Second call must NOT re-fetch (cached by TTL)
         with mock.patch(
-            "TwitchChannelPointsMiner.classes.Twitch.requests.get"
-        ) as mock_get:
+            "TwitchChannelPointsMiner.classes.Twitch.requests.post"
+        ) as mock_post:
             headers = self.twitch._integrity_headers()
-            mock_get.assert_not_called()
+            mock_post.assert_not_called()
         self.assertEqual(headers["Client-Integrity"], "abc")
 
     def test_expired_token_refetched(self):
         self.twitch.integrity_token = "old"
         self.twitch.integrity_expires = 0  # expired
         with mock.patch(
-            "TwitchChannelPointsMiner.classes.Twitch.requests.get",
+            "TwitchChannelPointsMiner.classes.Twitch.requests.post",
             return_value=FakeResp(200, {"token": "new", "expiration": 1800}),
         ):
             headers = self.twitch._integrity_headers()
         self.assertEqual(headers["Client-Integrity"], "new")
 
-    def test_failed_fetch_negative_cache(self):
+    def test_failed_fetch_sends_nothing(self):
+        """Regression: a lone X-Device-Id without a token made Twitch gate
+        ordinary queries ('user not found' on valid channels). When the
+        token is unavailable, send NO integrity headers at all."""
         with mock.patch(
-            "TwitchChannelPointsMiner.classes.Twitch.requests.get",
+            "TwitchChannelPointsMiner.classes.Twitch.requests.post",
             return_value=FakeResp(403),
         ):
             headers = self.twitch._integrity_headers()
-        self.assertNotIn("Client-Integrity", headers)
-        # Within negative-cache window: no refetch attempt
+        self.assertEqual(headers, {})
+        # Within negative-cache window: no refetch attempt, still bare
         with mock.patch(
-            "TwitchChannelPointsMiner.classes.Twitch.requests.get"
-        ) as mock_get:
-            self.twitch._integrity_headers()
-            mock_get.assert_not_called()
+            "TwitchChannelPointsMiner.classes.Twitch.requests.post"
+        ) as mock_post:
+            self.assertEqual(self.twitch._integrity_headers(), {})
+            mock_post.assert_not_called()
 
     def test_post_gql_attaches_headers_and_retries_on_integrity_fail(self):
         gql_calls = []

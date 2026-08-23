@@ -21,6 +21,7 @@ from TwitchChannelPointsMiner.classes.entities.Drop import Drop
 from TwitchChannelPointsMiner.classes.Exceptions import (
     StreamerDoesNotExistException,
     StreamerIsOfflineException,
+    StreamerLookupException,
 )
 from TwitchChannelPointsMiner.classes.Settings import (
     Events,
@@ -114,8 +115,10 @@ class Twitch(object):
             "X-Device-Id": self._load_device_id(),
         }
         try:
-            response = requests.get(
-                "https://gql.twitch.tv/integrity", headers=headers, timeout=15
+            response = requests.post(
+                "https://gql.twitch.tv/integrity",
+                headers=headers,
+                timeout=15,
             )
             if response.status_code == 200:
                 payload = response.json()
@@ -137,20 +140,23 @@ class Twitch(object):
         return self.integrity_token
 
     def _integrity_headers(self):
-        """X-Device-Id + a fresh-enough Client-Integrity token, or {}.
+        """Client-Integrity + X-Device-Id headers, or {} when unavailable.
 
-        The negative-cache window (integrity_expires in the future with no
-        token) suppresses repeated fetch attempts after failures."""
-        headers = {"X-Device-Id": self._load_device_id()}
+        Important: send BOTH together or NEITHER. A lone X-Device-Id
+        without an integrity token makes Twitch apply stricter gating to
+        ordinary queries (observed as 'user not found' on valid channels).
+        The negative-cache window suppresses repeated fetch attempts."""
         now = time.time()
         if self.integrity_token is None and now < self.integrity_expires:
-            # Recently failed to fetch - don't hammer the endpoint
-            return headers
+            return {}  # recently failed to fetch - fall back to bare headers
         if not self.integrity_token or now >= self.integrity_expires:
             self.refresh_integrity_token()
         if self.integrity_token:
-            headers["Client-Integrity"] = self.integrity_token
-        return headers
+            return {
+                "X-Device-Id": self._load_device_id(),
+                "Client-Integrity": self.integrity_token,
+            }
+        return {}
 
     def login(self):
         if os.path.isfile(self.cookies_file) is False:
@@ -308,16 +314,29 @@ class Twitch(object):
 
     def get_channel_id(self, streamer_username):
         json_data = copy.deepcopy(GQLOperations.ReportMenuItem)
-        json_data["variables"] = {"channelLogin": streamer_username}
+        json_data["variables"] = {"channelLogin": str(streamer_username).lower().strip()}
         json_response = self.post_gql_request(json_data)
         if (
             "data" not in json_response
             or "user" not in json_response["data"]
             or json_response["data"]["user"] is None
         ):
+            errors = json_response.get("errors") if isinstance(json_response, dict) else None
+            if errors:
+                # Lookup failed server-side (integrity/gating/etc) - do NOT
+                # claim the user doesn't exist; surface the real reason.
+                codes = [
+                    (e or {}).get("extensions", {}).get("code", "?")
+                    for e in errors
+                ]
+                logger.warning(
+                    f"Channel lookup for '{streamer_username}' failed: {codes}"
+                )
+                raise StreamerLookupException(
+                    f"Lookup for '{streamer_username}' failed ({', '.join(codes)})"
+                )
             raise StreamerDoesNotExistException
-        else:
-            return json_response["data"]["user"]["id"]
+        return json_response["data"]["user"]["id"]
 
     def get_followers(
         self, limit: int = 100, order: FollowersOrder = FollowersOrder.ASC

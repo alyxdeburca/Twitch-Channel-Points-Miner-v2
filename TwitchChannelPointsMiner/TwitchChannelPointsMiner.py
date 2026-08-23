@@ -5,6 +5,7 @@ import os
 import random
 import signal
 import sys
+import requests
 import threading
 import time
 import uuid
@@ -170,6 +171,12 @@ class TwitchChannelPointsMiner:
             streamer.channel_id = self.twitch.get_channel_id(username)
         except StreamerDoesNotExistException:
             return None, f"Twitch user '{username}' does not exist"
+        except StreamerLookupException as e:
+            # Server-side failure (integrity/gating) - the user may exist.
+            logger.warning(str(e))
+            return None, str(e)
+        except requests.RequestException as e:
+            return None, f"Twitch request failed: {e}"
 
         streamer.settings = set_default_settings(
             streamer.settings, Settings.streamer_settings
