@@ -68,11 +68,23 @@ Notes:
 
 ## Managing streamers from the dashboard
 
+Cards show each channel's Twitch profile picture (fetched once via GQL
+and cached under `.dashboard/avatars/`, with an initial-letter fallback).
+
+The list of tracked channels is persisted to `.dashboard_channels.json`
+in the working directory (updated on startup and after every add/remove).
+Both are gitignored.
+
 The Streamers panel has an **"＋ Add streamer"** button and a ✕ button on
 each card. Adding a streamer at runtime validates the channel on Twitch,
 loads its points context, joins its chat (per settings) and subscribes to
 its WebSocket topics immediately - no restart needed. Removing stops
 tracking it right away; points already earned stay in your account.
+
+Note: the username shown in the dashboard header comes from the
+authenticated Twitch token, not the `username=` in your run script - a
+placeholder is corrected automatically on login (and the cookies file is
+renamed accordingly).
 
 The **⚙ button** on each card opens a full settings editor applied live:
 

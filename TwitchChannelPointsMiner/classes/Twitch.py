@@ -9,6 +9,7 @@ import logging
 import os
 import random
 import re
+import threading
 import time
 from pathlib import Path
 from secrets import token_hex
@@ -38,6 +39,25 @@ from TwitchChannelPointsMiner.utils import (
 logger = logging.getLogger(__name__)
 
 
+def _safe_resync(twitch, streamer):
+    """Best-effort points refresh after a claim; never raises.
+
+    load_channel_points_context also auto-claims any newly available bonus,
+    so this is skipped when the user opted out of bonus claiming."""
+    if getattr(streamer, "auto_claim_bonus", False) is False:
+        try:
+            twitch.load_channel_points_context(
+                streamer, no_side_effects=True
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            twitch.load_channel_points_context(streamer)
+        except Exception:
+            pass
+
+
 class Twitch(object):
     __slots__ = ["cookies_file", "user_agent", "twitch_login", "running"]
 
@@ -56,6 +76,65 @@ class Twitch(object):
         else:
             self.twitch_login.load_cookies(self.cookies_file)
             self.twitch_login.set_token(self.twitch_login.get_auth_token())
+
+        # Reconcile the configured username with the actual authenticated
+        # account. The run script may contain a placeholder or stale name;
+        # the imported browser token is authoritative.
+        authenticated = self.twitch_login.get_authenticated_username()
+        if authenticated and authenticated != self.twitch_login.username:
+            logger.info(
+                f"Authenticated on Twitch as '{authenticated}' "
+                f"(configured: '{self.twitch_login.username}')"
+            )
+            previous = self.twitch_login.username
+            self.twitch_login.username = authenticated
+            if previous and os.path.isfile(self.cookies_file):
+                cookies_dir = os.path.dirname(self.cookies_file)
+                renamed_path = os.path.join(cookies_dir, f"{authenticated}.pkl")
+                try:
+                    if not os.path.isfile(renamed_path):
+                        os.replace(self.cookies_file, renamed_path)
+                        self.cookies_file = renamed_path
+                        logger.info(f"Cookies cached as {renamed_path}")
+                    else:
+                        self.cookies_file = renamed_path
+                except OSError:
+                    pass
+        return authenticated
+
+    def get_profile_picture(self, username, size=150):
+        """Download a streamer's Twitch avatar to .dashboard/avatars/<user>.png.
+
+        Uses the same GQL endpoint as all other miner requests.
+        Returns the local path or None on failure."""
+        try:
+            response = self.post_gql_request(
+                {
+                    "query": (
+                        "query GetUser($login: String!) { user(login: $login) "
+                        "{ profileImageURL(width: %d) } }" % int(size)
+                    ),
+                    "variables": {"login": str(username).lower().strip()},
+                }
+            )
+            url = ((response or {}).get("data") or {}).get("user", {}).get(
+                "profileImageURL"
+            )
+            if not url:
+                return None
+            avatars_dir = os.path.join(Path().absolute(), ".dashboard", "avatars")
+            Path(avatars_dir).mkdir(parents=True, exist_ok=True)
+            local_path = os.path.join(avatars_dir, f"{str(username).lower()}.png")
+            if not os.path.isfile(local_path):
+                image = requests.get(url, headers={"User-Agent": self.user_agent}, timeout=15)
+                image.raise_for_status()
+                with open(local_path, "wb") as fh:
+                    fh.write(image.content)
+            return local_path
+        except (requests.RequestException, ValueError, OSError) as e:
+            logger.debug(f"Could not fetch avatar for {username}: {e}")
+            return None
+
     # === STREAMER / STREAM / INFO === #
     def update_stream(self, streamer):
         if streamer.stream.update_required() is True:
@@ -408,7 +487,7 @@ class Twitch(object):
 
     # === CHANNEL POINTS / PREDICTION === #
     # Load the amount of current points for a channel, check if a bonus is available
-    def load_channel_points_context(self, streamer):
+    def load_channel_points_context(self, streamer, no_side_effects=False):
         json_data = copy.deepcopy(GQLOperations.ChannelPointsContext)
         json_data["variables"] = {"channelLogin": streamer.username}
 
@@ -421,7 +500,7 @@ class Twitch(object):
             streamer.channel_points = community_points["balance"]
             streamer.activeMultipliers = community_points["activeMultipliers"]
 
-            if community_points["availableClaim"] is not None:
+            if no_side_effects is False and community_points["availableClaim"] is not None:
                 self.claim_bonus(streamer, community_points["availableClaim"]["id"])
 
     def make_predictions(self, event):
@@ -504,6 +583,7 @@ class Twitch(object):
             )
 
     def claim_bonus(self, streamer, claim_id):
+        """Claim a channel-points bonus. Returns True if Twitch accepted it."""
         if Settings.logger.less is False:
             logger.info(
                 f"Claiming the bonus for {streamer}!",
@@ -514,7 +594,45 @@ class Twitch(object):
         json_data["variables"] = {
             "input": {"channelID": streamer.channel_id, "claimID": claim_id}
         }
-        self.post_gql_request(json_data)
+        response = self.post_gql_request(json_data)
+
+        # Surface failures: previously the response was discarded entirely,
+        # so rejected claims were indistinguishable from successful ones.
+        accepted = False
+        detail = ""
+        if not isinstance(response, dict) or response == {}:
+            detail = "no response from Twitch"
+        else:
+            claim_error = (
+                ((response.get("data") or {}).get("claimCommunityPoints") or {}).get(
+                    "error"
+                )
+                or {}
+            ).get("code")
+            gql_errors = response.get("errors")
+            if claim_error:
+                detail = f"Twitch rejected the claim (code: {claim_error})"
+            elif gql_errors:
+                detail = f"GQL error: {gql_errors}"
+            else:
+                accepted = True
+
+        if accepted:
+            logger.info(
+                f"Bonus claimed for {streamer.username}",
+                extra={"emoji": ":gift:", "event": Events.BONUS_CLAIM},
+            )
+            # Re-sync the balance shortly after so the dashboard (and the
+            # user) sees the new total; no auto-claim here to avoid loops.
+            resync_timer = threading.Timer(
+                4.0,
+                lambda: _safe_resync(self, streamer),
+            )
+            resync_timer.daemon = True
+            resync_timer.start()
+        else:
+            logger.warning(f"Bonus claim for {streamer.username} did NOT succeed: {detail}")
+        return accepted
 
     # === CAMPAIGNS / DROPS / INVENTORY === #
     def __get_campaign_ids_from_streamer(self, streamer):

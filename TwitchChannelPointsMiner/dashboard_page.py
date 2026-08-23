@@ -61,6 +61,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   .card:hover { border-color: #4a4a52; }
   .card .top { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .avatar {
+    width: 36px; height: 36px; border-radius: 50%; object-fit: cover;
+    background: var(--panel2); border: 1px solid var(--border); flex: none;
+  }
+  .avatar-fallback {
+    width: 36px; height: 36px; border-radius: 50%; flex: none;
+    display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(135deg, #9147ff55, #a970ff33);
+    border: 1px solid var(--border); color: var(--accent); font-weight: 700; font-size: 14px;
+    text-transform: uppercase;
+  }
   .card .name { font-weight: 700; font-size: 15px; }
   .card .online-tag { font-size: 10px; padding: 2px 7px; border-radius: 999px; font-weight: 600; }
   .online-tag.live { background: rgba(239,68,68,.15); color: var(--red); }
@@ -318,7 +329,8 @@ function renderAll(d) {
       .join("");
     return `<div class="card">
     <div class="top">
-      <span class="dot ${s.online ? "on" : "off"}"></span>
+      <img class="avatar" src="/avatars/${esc(s.username)}" alt=""
+           onerror="this.outerHTML='<div class=&quot;avatar-fallback&quot;>${esc((s.username||'?')[0])}</div>'">
       <a class="name" href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.username)}</a>
       <span class="online-tag ${s.online ? "live" : "off"}">${s.online ? "LIVE" : "OFFLINE"}</span>
       <button class="card-gear" title="Settings for ${esc(s.username)}" data-settings="${esc(s.username)}">⚙</button>

@@ -421,7 +421,12 @@ class TwitchChannelPointsMiner:
             self.running = True
             self.start_datetime = datetime.now()
 
-            self.twitch.login()
+            authenticated_username = self.twitch.login()
+            if authenticated_username:
+                # The token is authoritative: fix any placeholder/stale
+                # username from the run script so the dashboard, chat
+                # threads and future logins all use the real account.
+                self.username = authenticated_username
 
             if self.claim_drops_startup is True:
                 self.twitch.claim_all_drops_from_inventory()

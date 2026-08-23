@@ -153,3 +153,6 @@ analytics/*
 
 # Web dashboard
 .dashboard_session_secret
+.dashboard_channels.json
+.dashboard/
+avatars/

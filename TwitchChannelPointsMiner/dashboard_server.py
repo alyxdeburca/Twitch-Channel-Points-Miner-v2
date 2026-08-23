@@ -10,6 +10,8 @@ import logging
 import os
 import time
 import copy
+import base64
+import json as _json
 from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Lock, Thread
@@ -445,7 +447,7 @@ class StateProvider(object):
 
 
 class DashboardServer(Thread):
-    """Threaded, read-only dashboard for the miner.
+    """Threaded dashboard for the miner.
 
     Usage inside your run script:
 
@@ -454,7 +456,7 @@ class DashboardServer(Thread):
 
     Or standalone (demo data):
 
-        python -m TwitchChannelPointsMiner.dashboard_server --demo
+        python -m TwitchChannelPointsMiner.dashboard_demo --demo
     """
 
     def __init__(
@@ -463,24 +465,64 @@ class DashboardServer(Thread):
         host: str = "127.0.0.1",
         port: int = 8181,
         require_auth: bool = True,
+        channels_file: str = None,
     ):
         super(DashboardServer, self).__init__()
         self.host = host
         self.port = port
         self.state = StateProvider(miner)
         self.provider = self.state  # alias
+        self.channels_file = channels_file or os.path.join(
+            os.getcwd(), ".dashboard_channels.json"
+        )
         self.auth = TwitchAuth(host=host, port=port)
         self.sessions = SessionStore()
         # Auth is enforced only when a Twitch client id is configured;
         # otherwise the dashboard stays open (e.g. quick local demo).
         self.require_auth = require_auth and self.auth.enabled
-        # Serializes streamers add/remove so concurrent HTTP requests
-        # can't interleave with each other.
+        # Serializes streamers add/remove/settings so concurrent HTTP
+        # requests can't interleave with each other.
         self.mutation_lock = Lock()
         self.daemon = True
         self.name = "Dashboard Thread"
         self._lock = Lock()
         self._html_cache = None
+
+    def _load_channels_file(self):
+        try:
+            if os.path.isfile(self.channels_file):
+                with open(self.channels_file, "r", encoding="utf-8") as fh:
+                    return _json.load(fh)
+        except (OSError, ValueError):
+            pass
+        return []
+
+    def sync_channels_file(self):
+        """Persist the tracked channel list to disk (best effort).
+
+        Written after every mutation and once at startup."""
+        usernames = [s["username"] for s in self.state.streamers()]
+        payload = {
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "count": len(usernames),
+            "channels": sorted(usernames),
+        }
+        try:
+            with open(self.channels_file, "w", encoding="utf-8") as fh:
+                _json.dump(payload, fh, indent=2)
+        except OSError:
+            logger.debug(f"Could not write {self.channels_file}")
+        return self.channels_file
+
+    def get_avatar_path(self, username):
+        """Fetch (or reuse) the avatar for username; returns local path or None."""
+        fetcher = getattr(self.state.miner.twitch, "get_profile_picture", None) if not self.state.demo else None
+        if fetcher is None:
+            return None
+        try:
+            return fetcher(username)
+        except Exception:
+            return None
 
     # --------------------------- API ---------------------------------- #
     def get_config(self):
@@ -539,6 +581,8 @@ class DashboardServer(Thread):
             if method is None:
                 return False, "attached miner does not support runtime changes"
             _, error = method(username)
+            if error is None:
+                self.sync_channels_file()
             return error is None, error
 
     def update_streamer_settings(self, username, update):
@@ -593,8 +637,10 @@ class DashboardServer(Thread):
             method = getattr(self.state.miner, "remove_streamer", None)
             if method is None:
                 return False, "attached miner does not support runtime changes"
-            ok = method(username)
-            return bool(ok), None if ok else "streamer not tracked"
+            ok = bool(method(username))
+            if ok:
+                self.sync_channels_file()
+            return ok, None if ok else "streamer not tracked"
 
     def _api_status(self):
         streamers = self.state.streamers()
@@ -753,6 +799,21 @@ class DashboardServer(Thread):
                         return self._send(302, "text/html", "", extra_headers=[("Location", "/auth/login")])
                 if path == "/":
                     return self._html()
+                if path.startswith("/avatars/"):
+                    name = os.path.basename(path[len("/avatars/"):])
+                    local = server.get_avatar_path(name) if name else None
+                    if local and os.path.isfile(local):
+                        with open(local, "rb") as fh:
+                            return self._send(200, "image/png", fh.read())
+                    # 1x1 transparent PNG placeholder (UI shows initials)
+                    return self._send(
+                        200,
+                        "image/png",
+                        base64.b64decode(
+                            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAABzenr0"
+                            "AAAADUlEQVR4nGNgYGBgAAAABQABh6FO1AAAAABJRU5ErkJggg=="
+                        ),
+                    )
                 if path == "/api/status":
                     return self._json(server._api_status())
                 if path == "/api/streamers":
@@ -822,6 +883,8 @@ class DashboardServer(Thread):
         httpd = ThreadingHTTPServer((self.host, self.port), self._make_handler())
         self.httpd = httpd  # exposed for tests / graceful shutdown
         httpd.daemon_threads = True
+        # Persist the initial tracked-channels list
+        self.sync_channels_file()
         logger.info(
             f"Dashboard running on http://{self.host}:{self.port}/",
             extra={"emoji": ":desktop_computer:"},

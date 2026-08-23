@@ -129,6 +129,31 @@ class TwitchLogin(object):
             self.username = cookies_dict["login"]
         return cookies_dict["auth-token"]
 
+    def get_authenticated_username(self):
+        """Return the login name that owns the current auth token, or None.
+
+        Queries Twitch GQL with the imported browser token - authoritative,
+        unlike the 'login' cookie which can be stale."""
+        if self.token is None:
+            return None
+        try:
+            response = requests.post(
+                "https://gql.twitch.tv/gql",
+                json={"query": "{ currentUser { login id } }"},
+                headers={
+                    "Client-ID": self.client_id,
+                    "Authorization": f"OAuth {self.token}",
+                },
+                timeout=10,
+            )
+            if response.status_code == 200:
+                current_user = (response.json().get("data") or {}).get("currentUser")
+                if current_user and current_user.get("login"):
+                    return current_user["login"].lower()
+        except (requests.RequestException, ValueError):
+            pass
+        return None
+
     def check_login(self):
         if self.login_check_result:
             return self.login_check_result
