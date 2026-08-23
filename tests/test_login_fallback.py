@@ -1,86 +1,107 @@
 # -*- coding: utf-8 -*-
-"""Regression tests for the Twitch login fallback.
+"""Tests for the cookie-only login flow.
 
-passport.twitch.tv/login now often replies with a CAPTCHA challenge
-(HTML or empty body) instead of JSON. The miner must fall back to the
-browser-cookie flow instead of crashing with a JSONDecodeError.
+Password/console login was removed (Twitch answers it with CAPTCHA);
+the miner imports the twitch.tv session from your browser instead and
+caches it in cookies/<username>.pkl.
 """
 import unittest
 from unittest import mock
 
-from TwitchChannelPointsMiner.classes.Exceptions import (
-    BadCredentialsException,
-)
 from TwitchChannelPointsMiner.classes.TwitchLogin import TwitchLogin
 
 CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 
 
 def make_login():
-    login = TwitchLogin(CLIENT_ID, "testuser", "test-agent", password="pw")
-    return login
+    return TwitchLogin(CLIENT_ID, "testuser", "test-agent")
 
 
-class FakeResp(object):
-    def __init__(self, payload=None, raw=None, status_code=200):
-        self._payload = payload
-        self.status_code = status_code
-        self.text = raw or ""
+class FakeBc3(object):
+    """Stand-in for the browser_cookie3 module."""
 
-    def json(self):
-        if self._payload is None:
-            raise ValueError("Expecting value")  # what requests raises on bad JSON
-        return self._payload
+    def __init__(self, jar=None):
+        self._jar = jar or object()
+        self.calls = []
+
+    def _make(self, name):
+        def loader(**kwargs):
+            self.calls.append((name, kwargs))
+            return self._jar
+
+        return loader
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return self._make(name)
 
 
-class LoginFallbackTests(unittest.TestCase):
-    def test_non_json_response_maps_to_captcha_error_1000(self):
+class CookieOnlyFlowTests(unittest.TestCase):
+    def test_login_flow_returns_false_when_browser_import_fails(self):
         login = make_login()
         with mock.patch.object(
-            login.session, "post", return_value=FakeResp(raw="<html>captcha</html>")
-        ):
-            result = login.send_login_request({"username": "x", "password": "y"})
-        self.assertEqual(result, {"error_code": 1000})
+            TwitchLogin,
+            "login_flow_backup",
+            mock.MagicMock(return_value=None),
+        ) as backup:
+            self.assertFalse(login.login_flow())
+            backup.assert_called_once()
+            self.assertIsNone(login.token)
 
-    def test_empty_body_maps_to_captcha_error_1000(self):
-        login = make_login()
-        with mock.patch.object(login.session, "post", return_value=FakeResp(raw="")):
-            result = login.send_login_request({})
-        self.assertEqual(result, {"error_code": 1000})
-
-    def test_valid_json_passthrough(self):
+    def test_login_flow_success_sets_token(self):
         login = make_login()
         with mock.patch.object(
-            login.session,
-            "post",
-            return_value=FakeResp(payload={"access_token": "tok"}),
-        ):
-            result = login.send_login_request({})
-        self.assertEqual(result, {"access_token": "tok"})
-
-    def test_login_flow_uses_backup_when_captcha_required(self):
-        login = make_login()
-        # TwitchLogin defines __slots__, so patch at class level, not instance
-        with mock.patch.object(
-            login.session, "post", return_value=FakeResp(raw="")
-        ), mock.patch.object(
             TwitchLogin,
             "login_flow_backup",
             mock.MagicMock(return_value="browser-token"),
-        ) as backup, mock.patch.object(
+        ), mock.patch.object(
             TwitchLogin,
             "check_login",
             mock.MagicMock(return_value=True),
         ):
             self.assertTrue(login.login_flow())
-            backup.assert_called_once()
             self.assertEqual(login.token, "browser-token")
+            self.assertEqual(
+                login.session.headers["Authorization"], "Bearer browser-token"
+            )
+
+    def test_cookies_saved_even_when_verification_flakes(self):
+        # Regression: a transient GQL failure used to mean the imported
+        # session was never cached, forcing a browser re-import every run.
+        login = make_login()
+        with mock.patch.object(
+            TwitchLogin,
+            "login_flow_backup",
+            mock.MagicMock(return_value="browser-token"),
+        ), mock.patch.object(
+            TwitchLogin,
+            "check_login",
+            mock.MagicMock(return_value=False),
+        ):
+            self.assertTrue(login.login_flow())
+
+    def test_backup_prompts_and_loads_chrome_cookies(self):
+        login = make_login()
+        fake_bc3 = FakeBc3()
+        answers = iter(["1", ""])  # browser choice, then "press Enter"
+        with mock.patch(
+            "TwitchChannelPointsMiner.classes.TwitchLogin.browser_cookie3", fake_bc3
+        ), mock.patch(
+            "builtins.input", side_effect=lambda *a: next(answers)
+        ), mock.patch(
+            "TwitchChannelPointsMiner.classes.TwitchLogin.requests.utils.dict_from_cookiejar",
+            return_value={"login": "chromeuser", "auth-token": "tok-chr"},
+        ):
+            token = login.login_flow_backup()
+        self.assertEqual(token, "tok-chr")
+        self.assertEqual(login.username, "chromeuser")
+        self.assertEqual(fake_bc3.calls[0][0], "chrome")
 
     def test_safari_option_loads_cookies(self):
         login = make_login()
-        fake_bc3 = mock.MagicMock()
-        fake_bc3.safari.return_value = object()
-        answers = iter(["4", ""])  # browser choice, then "press Enter"
+        fake_bc3 = FakeBc3()
+        answers = iter(["4", ""])
         with mock.patch(
             "TwitchChannelPointsMiner.classes.TwitchLogin.browser_cookie3", fake_bc3
         ), mock.patch(
@@ -92,12 +113,11 @@ class LoginFallbackTests(unittest.TestCase):
             token = login.login_flow_backup()
         self.assertEqual(token, "tok-saf")
         self.assertEqual(login.username, "safariuser")
-        fake_bc3.safari.assert_called_once()
+        self.assertEqual(fake_bc3.calls[0][0], "safari")
 
     def test_missing_auth_token_returns_none_with_hint(self):
         login = make_login()
-        fake_bc3 = mock.MagicMock()
-        fake_bc3.chrome.return_value = object()
+        fake_bc3 = FakeBc3()
         answers = iter(["1", ""])
         with mock.patch(
             "TwitchChannelPointsMiner.classes.TwitchLogin.browser_cookie3", fake_bc3
@@ -109,15 +129,19 @@ class LoginFallbackTests(unittest.TestCase):
         ):
             self.assertIsNone(login.login_flow_backup())
 
-    def test_bad_credentials_still_raise_when_password_configured(self):
-        login = make_login()  # password configured -> no interactive retry
-        with mock.patch.object(
-            login.session,
-            "post",
-            return_value=FakeResp(payload={"error_code": 3001}),
+    def test_unreadable_cookie_jar_returns_none_with_hint(self):
+        login = make_login()
+        fake_bc3 = FakeBc3()
+        answers = iter(["2", ""])
+        with mock.patch(
+            "TwitchChannelPointsMiner.classes.TwitchLogin.browser_cookie3", fake_bc3
+        ), mock.patch(
+            "builtins.input", side_effect=lambda *a: next(answers)
+        ), mock.patch(
+            "TwitchChannelPointsMiner.classes.TwitchLogin.requests.utils.dict_from_cookiejar",
+            side_effect=PermissionError("keychain denied"),
         ):
-            with self.assertRaises(BadCredentialsException):
-                login.login_flow()
+            self.assertIsNone(login.login_flow_backup())
 
 
 if __name__ == "__main__":

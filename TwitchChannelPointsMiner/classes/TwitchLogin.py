@@ -3,7 +3,6 @@
 # The MIT License (MIT)
 
 import copy
-import getpass
 import logging
 import os
 import pickle
@@ -11,10 +10,7 @@ import pickle
 import browser_cookie3
 import requests
 
-from TwitchChannelPointsMiner.classes.Exceptions import (
-    BadCredentialsException,
-    WrongCookiesException,
-)
+from TwitchChannelPointsMiner.classes.Exceptions import WrongCookiesException
 from TwitchChannelPointsMiner.constants import GQLOperations
 
 logger = logging.getLogger(__name__)
@@ -26,15 +22,13 @@ class TwitchLogin(object):
         "token",
         "login_check_result",
         "session",
-        "session",
         "username",
-        "password",
         "user_id",
         "email",
         "cookies",
     ]
 
-    def __init__(self, client_id, username, user_agent, password=None):
+    def __init__(self, client_id, username, user_agent):
         self.client_id = client_id
         self.token = None
         self.login_check_result = False
@@ -43,124 +37,40 @@ class TwitchLogin(object):
             {"Client-ID": self.client_id, "User-Agent": user_agent}
         )
         self.username = username
-        self.password = password
         self.user_id = None
         self.email = None
 
         self.cookies = []
 
     def login_flow(self):
-        logger.info("You'll have to login to Twitch!")
+        """Cookie-only login: import the twitch.tv session from your browser.
 
-        post_data = {
-            "client_id": self.client_id,
-            "undelete_user": False,
-            "remember_me": True,
-        }
-
-        use_backup_flow = False
-
-        for attempt in range(0, 25):
-            password = (
-                getpass.getpass(f"Enter Twitch password for {self.username}: ")
-                if self.password in [None, ""]
-                else self.password
+        Console/password logins are no longer attempted - Twitch answers
+        them with CAPTCHA challenges. Log in to twitch.tv in your normal
+        browser once; the miner copies that session and caches it locally
+        (cookies/<username>.pkl) so later runs skip this step.
+        """
+        logger.info(
+            f"No cookies found for {self.username} - importing your Twitch login from your browser."
+        )
+        token = self.login_flow_backup()
+        if token is None:
+            return False
+        self.set_token(token)
+        if self.check_login() is False:
+            # The GQL sanity check can fail transiently while the imported
+            # session itself is perfectly valid. Save the cookies anyway -
+            # otherwise a working login would never be cached and every
+            # run would repeat the browser import.
+            logger.warning(
+                "Imported session could not be verified right now - saving cookies anyway. "
+                f"If mining fails later, delete the cookies file for {self.username} and retry."
             )
-
-            post_data["username"] = self.username
-            post_data["password"] = password
-
-            while True:
-                # Try login without 2FA
-                login_response = self.send_login_request(post_data)
-
-                if "captcha_proof" in login_response:
-                    post_data["captcha"] = dict(proof=login_response["captcha_proof"])
-
-                if "error_code" in login_response:
-                    err_code = login_response["error_code"]
-                    if err_code in [3011, 3012]:  # missing 2fa token
-                        if err_code == 3011:
-                            logger.info(
-                                "Two factor authentication enabled, please enter token below."
-                            )
-                        else:
-                            logger.info("Invalid two factor token, please try again.")
-
-                        twofa = input("2FA token: ")
-                        post_data["authy_token"] = twofa.strip()
-                        continue
-
-                    elif err_code in [3022, 3023]:  # missing 2fa token
-                        if err_code == 3022:
-                            logger.info("Login Verification code required.")
-                            self.email = login_response["obscured_email"]
-                        else:
-                            logger.info(
-                                "Invalid Login Verification code entered, please try again."
-                            )
-
-                        twofa = input(
-                            f"Please enter the 6-digit code sent to {self.email}: "
-                        )
-                        post_data["twitchguard_code"] = twofa.strip()
-                        continue
-
-                    # invalid password, or password not provided
-                    elif err_code in [3001, 3003]:
-                        logger.info("Invalid username or password, please try again.")
-
-                        # If the password is loaded from run.py, require the user to fix it there.
-                        if self.password not in [None, ""]:
-                            raise BadCredentialsException(
-                                "Username or password is incorrect."
-                            )
-
-                        # If the user didn't load the password from run.py we can just ask for it again.
-                        break
-                    elif err_code == 1000:
-                        logger.info(
-                            "Console login unavailable (CAPTCHA solving required)."
-                        )
-                        use_backup_flow = True
-                        break
-                    else:
-                        logger.error(f"Unknown error: {login_response}")
-                        raise NotImplementedError(
-                            f"Unknown TwitchAPI error code: {err_code}"
-                        )
-
-                if "access_token" in login_response:
-                    self.set_token(login_response["access_token"])
-                    return self.check_login()
-
-            if use_backup_flow:
-                break
-
-        if use_backup_flow:
-            self.set_token(self.login_flow_backup())
-            return self.check_login()
-
-        return False
+        return True
 
     def set_token(self, new_token):
         self.token = new_token
         self.session.headers.update({"Authorization": f"Bearer {self.token}"})
-
-    def send_login_request(self, json_data):
-        response = self.session.post("https://passport.twitch.tv/login", json=json_data)
-        try:
-            return response.json()
-        except ValueError:  # requests.exceptions.JSONDecodeError subclasses ValueError
-            # Twitch frequently answers console-style logins with a CAPTCHA
-            # challenge (HTML/empty body) instead of JSON. Report it as
-            # error_code 1000 so login_flow() falls back to the
-            # browser-cookie login flow instead of crashing.
-            logger.warning(
-                f"Login endpoint returned a non-JSON response (HTTP {response.status_code}). "
-                "Twitch is requiring CAPTCHA/interactive login - switching to the browser cookie flow."
-            )
-            return {"error_code": 1000}
 
     def login_flow_backup(self):
         """Backup OAuth login flow in case manual captcha solving is required"""

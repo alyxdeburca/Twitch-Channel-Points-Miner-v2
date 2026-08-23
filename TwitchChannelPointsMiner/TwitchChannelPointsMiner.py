@@ -72,7 +72,6 @@ class TwitchChannelPointsMiner:
     def __init__(
         self,
         username: str,
-        password: str = None,
         claim_drops_startup: bool = False,
         # Settings for logging and selenium as you can see.
         priority: list = [Priority.STREAK, Priority.DROPS, Priority.ORDER],
@@ -95,7 +94,7 @@ class TwitchChannelPointsMiner:
         Settings.streamer_settings = streamer_settings
 
         user_agent = get_user_agent("FIREFOX")
-        self.twitch = Twitch(self.username, user_agent, password)
+        self.twitch = Twitch(self.username, user_agent)
 
         self.claim_drops_startup = claim_drops_startup
         self.priority = priority if isinstance(priority, list) else [priority]
