@@ -150,3 +150,6 @@ logs/*
 screenshots/*
 htmls/*
 analytics/*
+
+# Web dashboard
+.dashboard_session_secret

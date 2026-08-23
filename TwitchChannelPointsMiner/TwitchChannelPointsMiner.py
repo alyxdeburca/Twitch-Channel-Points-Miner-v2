@@ -13,6 +13,7 @@ from pathlib import Path
 
 from TwitchChannelPointsMiner.classes.AnalyticsServer import AnalyticsServer
 from TwitchChannelPointsMiner.classes.Chat import ChatPresence, ThreadChat
+from TwitchChannelPointsMiner.dashboard_server import DashboardServer
 from TwitchChannelPointsMiner.classes.entities.PubsubTopic import PubsubTopic
 from TwitchChannelPointsMiner.classes.entities.Streamer import (
     Streamer,
@@ -59,6 +60,7 @@ class TwitchChannelPointsMiner:
         "minute_watcher_thread",
         "sync_campaigns_thread",
         "ws_pool",
+        "dashboard_server",
         "session_id",
         "running",
         "start_datetime",
@@ -103,6 +105,7 @@ class TwitchChannelPointsMiner:
         self.minute_watcher_thread = None
         self.sync_campaigns_thread = None
         self.ws_pool = None
+        self.dashboard_server = None
 
         self.session_id = str(uuid.uuid4())
         self.running = False
@@ -139,6 +142,11 @@ class TwitchChannelPointsMiner:
         http_server.daemon = True
         http_server.name = "Analytics Thread"
         http_server.start()
+
+    def dashboard(self, host: str = "127.0.0.1", port: int = 8181):
+        """Start the live web dashboard (read-only) for this miner."""
+        self.dashboard_server = DashboardServer(miner=self, host=host, port=port)
+        self.dashboard_server.start()
 
     def mine(
         self,

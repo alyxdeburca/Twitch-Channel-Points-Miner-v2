@@ -50,10 +50,11 @@ Currently, we have a lot of PRs requests opened, but the time to test and improv
     - [FilterCondition](#filtercondition)
         - [Example](#example)
 6. 📈 [Analytics](#analytics)
-7. 🍪 [Migrating from an old repository (the original one)](#migrating-from-an-old-repository-the-original-one)
-8. 🪟 [Windows](#windows)
-9. 📱 [Termux](#termux)
-10. ⚠️ [Disclaimer](#disclaimer)
+7. 🖥️ [Web Dashboard](#web-dashboard)
+8. 🍪 [Migrating from an old repository (the original one)](#migrating-from-an-old-repository-the-original-one)
+9. 🪟 [Windows](#windows)
+10. 📱 [Termux](#termux)
+11. ⚠️ [Disclaimer](#disclaimer)
 
 
 ## Community
@@ -589,6 +590,20 @@ from TwitchChannelPointsMiner import TwitchChannelPointsMiner
 twitch_miner = TwitchChannelPointsMiner("your-twitch-username")
 twitch_miner.analytics(host="127.0.0.1", port=5000, refresh=5, days_ago=7)   # Analytics web-server
 twitch_miner.mine(followers=True, blacklist=["user1", "user2"])
+```
+
+## Web Dashboard
+A modern, self-contained replacement for the analytics page: a live dashboard showing channel points for every streamer, online status, active predictions with outcome bars and countdowns, and an event feed — no extra dependencies.
+It reads state directly from the running miner (no chart files needed) and supports an optional **Sign in with Twitch** gate (authorization-code or device flow) so it is safe to expose on `0.0.0.0` / Tailscale / SSH tunnels. Full documentation: [`docs/DASHBOARD.md`](docs/DASHBOARD.md).
+```python
+from TwitchChannelPointsMiner import TwitchChannelPointsMiner
+twitch_miner = TwitchChannelPointsMiner("your-twitch-username")
+twitch_miner.dashboard(host="0.0.0.0", port=8181)   # Live web dashboard
+twitch_miner.mine(followers=True, blacklist=["user1", "user2"])
+```
+You can also try it without a Twitch account:
+```bash
+python -m TwitchChannelPointsMiner.dashboard_demo --demo --port 8181
 ```
 
 ## Migrating from an old repository (the original one):
