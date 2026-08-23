@@ -147,6 +147,77 @@ class TwitchChannelPointsMiner:
         self.dashboard_server = DashboardServer(miner=self, host=host, port=port)
         self.dashboard_server.start()
 
+    def add_streamer(self, username: str):
+        """Track a new streamer at runtime (also used by the web dashboard).
+
+        Returns (streamer, None) on success or (None, reason) on failure.
+        """
+        username = str(username).lower().strip()
+        if not username:
+            return None, "empty username"
+        if any(s.username == username for s in self.streamers):
+            return None, f"'{username}' is already being tracked"
+
+        streamer = Streamer(username)
+        try:
+            streamer.channel_id = self.twitch.get_channel_id(username)
+        except StreamerDoesNotExistException:
+            return None, f"Twitch user '{username}' does not exist"
+
+        streamer.settings = set_default_settings(
+            streamer.settings, Settings.streamer_settings
+        )
+        streamer.settings.bet = set_default_settings(
+            streamer.settings.bet, Settings.streamer_settings.bet
+        )
+        if streamer.settings.chat != ChatPresence.NEVER:
+            streamer.irc_chat = ThreadChat(
+                self.username,
+                self.twitch.twitch_login.get_auth_token(),
+                streamer.username,
+            )
+
+        self.twitch.load_channel_points_context(streamer)
+        self.twitch.check_streamer_online(streamer)
+
+        self.streamers.append(streamer)
+        # Keep original_streamers index-aligned for the session-gain report.
+        self.original_streamers.append(streamer.channel_points)
+
+        if self.ws_pool is not None:
+            self.ws_pool.submit(PubsubTopic("video-playback-by-id", streamer=streamer))
+            if streamer.settings.follow_raid is True:
+                self.ws_pool.submit(PubsubTopic("raid", streamer=streamer))
+            if streamer.settings.make_predictions is True:
+                self.ws_pool.submit(
+                    PubsubTopic("predictions-channel-v1", streamer=streamer)
+                )
+        logger.info(
+            f"Now tracking {username} ({len(self.streamers)} streamers)",
+            extra={"emoji": ":heavy_plus_sign:"},
+        )
+        return streamer, None
+
+    def remove_streamer(self, username: str) -> bool:
+        """Stop tracking a streamer at runtime (also used by the web dashboard)."""
+        username = str(username).lower().strip()
+        for index, streamer in enumerate(self.streamers):
+            if streamer.username == username:
+                try:
+                    if streamer.irc_chat is not None:
+                        streamer.leave_chat()
+                except Exception:
+                    pass
+                self.streamers.pop(index)
+                if index < len(self.original_streamers):
+                    self.original_streamers.pop(index)
+                logger.info(
+                    f"Stopped tracking {username} ({len(self.streamers)} streamers)",
+                    extra={"emoji": ":heavy_minus_sign:"},
+                )
+                return True
+        return False
+
     def mine(
         self,
         streamers: list = [],

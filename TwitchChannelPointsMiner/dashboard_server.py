@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import time
+import copy
 from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Lock, Thread
@@ -51,6 +52,59 @@ class StateProvider(object):
     def __init__(self, miner=None):
         self.miner = miner
         self.demo = miner is None
+        self.demo_streamers = [
+            {
+                "username": "demo_streamer",
+                "url": "https://twitch.tv/demo_streamer",
+                "online": True,
+                "channel_points": 128450,
+                "points_gained": 1250,
+                "viewers": 4210,
+                "game": "Software & Game Development",
+                "title": "Building a channel points miner dashboard",
+                "chat": True,
+                "watch_streak_missing": False,
+                "multipliers": 1.5,
+                "settings": {
+                    "make_predictions": True,
+                    "follow_raid": True,
+                    "claim_drops": True,
+                    "watch_streak": True,
+                    "bet": {"strategy": "SMART", "percentage": 5, "max_points": 50000},
+                },
+                "history": {
+                    "WATCH": {"counter": 214, "amount": 10700},
+                    "CLAIM": {"counter": 42, "amount": 4200},
+                    "WIN": {"counter": 7, "amount": 3120},
+                    "LOSE": {"counter": 3, "amount": -950},
+                    "WATCH_STREAK": {"counter": 4, "amount": 800},
+                },
+            },
+            {
+                "username": "second_channel",
+                "url": "https://twitch.tv/second_channel",
+                "online": False,
+                "channel_points": 55320,
+                "points_gained": 0,
+                "viewers": 0,
+                "game": None,
+                "title": None,
+                "chat": False,
+                "watch_streak_missing": True,
+                "multipliers": 0,
+                "settings": {
+                    "make_predictions": False,
+                    "follow_raid": True,
+                    "claim_drops": False,
+                    "watch_streak": True,
+                    "bet": {"strategy": "PERCENTAGE", "percentage": 5, "max_points": 1234},
+                },
+                "history": {
+                    "WATCH": {"counter": 96, "amount": 4800},
+                    "CLAIM": {"counter": 18, "amount": 1800},
+                },
+            },
+        ]
         self.demo_events = [
             {"time": time.time() - 60 * 8, "type": "BONUS_CLAIM", "streamer": "demo_streamer", "text": "Bonus claimed +50"},
             {"time": time.time() - 60 * 5, "type": "STREAMER_ONLINE", "streamer": "demo_streamer", "text": "demo_streamer is Online!"},
@@ -60,59 +114,7 @@ class StateProvider(object):
     # ------------------------------------------------------------------ #
     def streamers(self):
         if self.demo:
-            return [
-                {
-                    "username": "demo_streamer",
-                    "url": "https://twitch.tv/demo_streamer",
-                    "online": True,
-                    "channel_points": 128450,
-                    "points_gained": 1250,
-                    "viewers": 4210,
-                    "game": "Software & Game Development",
-                    "title": "Building a channel points miner dashboard",
-                    "chat": True,
-                    "watch_streak_missing": False,
-                    "multipliers": 1.5,
-                    "settings": {
-                        "make_predictions": True,
-                        "follow_raid": True,
-                        "claim_drops": True,
-                        "watch_streak": True,
-                        "bet": {"strategy": "SMART", "percentage": 5, "max_points": 50000},
-                    },
-                    "history": {
-                        "WATCH": {"counter": 214, "amount": 10700},
-                        "CLAIM": {"counter": 42, "amount": 4200},
-                        "WIN": {"counter": 7, "amount": 3120},
-                        "LOSE": {"counter": 3, "amount": -950},
-                        "WATCH_STREAK": {"counter": 4, "amount": 800},
-                    },
-                },
-                {
-                    "username": "second_channel",
-                    "url": "https://twitch.tv/second_channel",
-                    "online": False,
-                    "channel_points": 55320,
-                    "points_gained": 0,
-                    "viewers": 0,
-                    "game": None,
-                    "title": None,
-                    "chat": False,
-                    "watch_streak_missing": True,
-                    "multipliers": 0,
-                    "settings": {
-                        "make_predictions": False,
-                        "follow_raid": True,
-                        "claim_drops": False,
-                        "watch_streak": True,
-                        "bet": {"strategy": "PERCENTAGE", "percentage": 5, "max_points": 1234},
-                    },
-                    "history": {
-                        "WATCH": {"counter": 96, "amount": 4800},
-                        "CLAIM": {"counter": 18, "amount": 1800},
-                    },
-                },
-            ]
+            return copy.deepcopy(self.demo_streamers)
 
         streamers = getattr(self.miner, "streamers", None) or []
         result = []
@@ -312,12 +314,89 @@ class DashboardServer(Thread):
         # Auth is enforced only when a Twitch client id is configured;
         # otherwise the dashboard stays open (e.g. quick local demo).
         self.require_auth = require_auth and self.auth.enabled
+        # Serializes streamers add/remove so concurrent HTTP requests
+        # can't interleave with each other.
+        self.mutation_lock = Lock()
         self.daemon = True
         self.name = "Dashboard Thread"
         self._lock = Lock()
         self._html_cache = None
 
     # --------------------------- API ---------------------------------- #
+    def get_config(self):
+        """Dashboard capabilities + tracked usernames (for the manage UI)."""
+        if self.state.demo:
+            return {
+                "editable": True,
+                "demo": True,
+                "streamers": [s["username"] for s in self.state.streamers()],
+            }
+        return {
+            "editable": _safe(lambda: self.state.miner.running, False) is not None,
+            "demo": False,
+            "streamers": [
+                s.username for s in (_safe(lambda: list(self.state.miner.streamers), []) or [])
+            ],
+        }
+
+    def add_streamer(self, username):
+        """Validate + track a new streamer on the attached miner."""
+        username = str(username or "").strip()
+        if self.state.demo:
+            if not username:
+                return False, "empty username"
+            streamers = self.state.demo_streamers
+            if any(s["username"] == username.lower() for s in streamers):
+                return False, f"'{username}' is already being tracked"
+            streamers.append(
+                {
+                    "username": username.lower(),
+                    "url": f"https://twitch.tv/{username.lower()}",
+                    "online": False,
+                    "channel_points": 0,
+                    "points_gained": 0,
+                    "viewers": 0,
+                    "game": None,
+                    "title": None,
+                    "chat": False,
+                    "watch_streak_missing": True,
+                    "multipliers": 0,
+                    "settings": {
+                        "make_predictions": True,
+                        "follow_raid": True,
+                        "claim_drops": True,
+                        "watch_streak": True,
+                        "bet": {"strategy": "SMART", "percentage": 5, "max_points": 50000},
+                    },
+                    "history": {},
+                }
+            )
+            return True, None
+        with self.mutation_lock:
+            method = getattr(self.state.miner, "add_streamer", None)
+            if method is None:
+                return False, "attached miner does not support runtime changes"
+            _, error = method(username)
+            return error is None, error
+
+    def remove_streamer(self, username):
+        """Remove a tracked streamer. Returns (ok, error)."""
+        username = str(username or "").strip()
+        if self.state.demo:
+            before = len(self.state.demo_streamers)
+            self.state.demo_streamers = [
+                s for s in self.state.demo_streamers if s["username"] != username.lower()
+            ]
+            if len(self.state.demo_streamers) == before:
+                return False, "streamer not tracked"
+            return True, None
+        with self.mutation_lock:
+            method = getattr(self.state.miner, "remove_streamer", None)
+            if method is None:
+                return False, "attached miner does not support runtime changes"
+            ok = method(username)
+            return bool(ok), None if ok else "streamer not tracked"
+
     def _api_status(self):
         streamers = self.state.streamers()
         bets = self.state.bets()
@@ -483,6 +562,8 @@ class DashboardServer(Thread):
                     return self._json(server.state.bets())
                 if path == "/api/events":
                     return self._json(server.state.events())
+                if path == "/api/config":
+                    return self._json(server.get_config())
                 if path == "/api/all":
                     return self._json(
                         {
@@ -490,7 +571,39 @@ class DashboardServer(Thread):
                             "streamers": server.state.streamers(),
                             "bets": server.state.bets(),
                             "events": server.state.events(),
+                            "config": server.get_config(),
                         }
+                    )
+                return self._json({"error": "not found"}, status=404)
+
+            def do_POST(self):
+                parsed = urlparse(self.path)
+                path = parsed.path.rstrip("/") or "/"
+                if server.require_auth:
+                    username = server.sessions.resolve(
+                        server.auth.parse_session_cookie(self.headers.get("Cookie"))
+                    )
+                    if username is None:
+                        return self._json({"error": "unauthorized"}, status=401)
+
+                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    payload = json.loads(self.rfile.read(length) or b"{}")
+                    if not isinstance(payload, dict):
+                        raise ValueError
+                except ValueError:
+                    return self._json({"error": "invalid JSON body"}, status=400)
+
+                if path == "/api/streamers/add":
+                    ok, error = server.add_streamer(str(payload.get("username", "")))
+                    return self._json(
+                        {"success": ok, "error": error}, status=200 if ok else 400
+                    )
+                if path == "/api/streamers/remove":
+                    ok, error = server.remove_streamer(str(payload.get("username", "")))
+                    return self._json(
+                        {"success": ok, "error": error},
+                        status=200 if ok else 404,
                     )
                 return self._json({"error": "not found"}, status=404)
 
@@ -499,6 +612,7 @@ class DashboardServer(Thread):
     # --------------------------- Thread ------------------------------- #
     def run(self):
         httpd = ThreadingHTTPServer((self.host, self.port), self._make_handler())
+        self.httpd = httpd  # exposed for tests / graceful shutdown
         httpd.daemon_threads = True
         logger.info(
             f"Dashboard running on http://{self.host}:{self.port}/",

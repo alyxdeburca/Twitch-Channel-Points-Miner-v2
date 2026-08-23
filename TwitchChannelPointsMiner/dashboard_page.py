@@ -119,6 +119,45 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   #events li .etime { color: var(--dim); margin-right: 6px; }
   .empty { color: var(--dim); font-size: 12px; padding: 10px 2px; }
 
+  .panel-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
+  .panel-head h2 { margin-bottom:0; }
+  .btn {
+    border:1px solid var(--border); background:var(--accent2); color:#fff; font-weight:700;
+    padding:7px 14px; border-radius:8px; font-size:12px; cursor:pointer; transition:background .15s;
+  }
+  .btn:hover { background:var(--accent); }
+  .card-remove {
+    margin-left:auto; border:none; background:transparent; color:var(--dim); cursor:pointer;
+    font-size:15px; line-height:1; padding:2px 6px; border-radius:5px;
+  }
+  .card-remove:hover { color:var(--red); background:rgba(239,68,68,.12); }
+  #modal-backdrop {
+    display:none; position:fixed; inset:0; background:rgba(0,0,0,.65); z-index:50;
+    align-items:center; justify-content:center;
+  }
+  #modal-backdrop.open { display:flex; }
+  .modal {
+    background:var(--panel); border:1px solid var(--border); border-radius:12px;
+    width:min(420px,92vw); padding:22px;
+  }
+  .modal h3 { font-size:16px; margin-bottom:6px; }
+  .modal p { color:var(--muted); font-size:12px; line-height:1.55; margin-bottom:14px; }
+  .modal input[type=text] {
+    width:100%; padding:10px 12px; border-radius:8px; border:1px solid var(--border);
+    background:var(--panel2); color:var(--text); font-size:14px; outline:none;
+  }
+  .modal input[type=text]:focus { border-color:var(--accent); }
+  .modal-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:16px; }
+  .btn-secondary { background:var(--panel2); color:var(--text); }
+  .btn-secondary:hover { background:#2a2a30; }
+  #toast {
+    position:fixed; bottom:42px; left:50%; transform:translateX(-50%); z-index:60;
+    display:none; max-width:80vw; padding:10px 18px; border-radius:8px; font-size:13px; font-weight:600;
+    border:1px solid var(--border); background:var(--panel2); box-shadow:0 6px 24px rgba(0,0,0,.5);
+  }
+  #toast.ok { border-color:rgba(34,197,94,.5); color:var(--green); }
+  #toast.err { border-color:rgba(239,68,68,.5); color:var(--red); }
+
   footer { position: fixed; bottom: 0; left: 0; right: 0; text-align: center; padding: 6px;
     background: rgba(14,14,16,.85); backdrop-filter: blur(4px); color: var(--dim); font-size: 11px;
     border-top: 1px solid var(--border); }
@@ -137,7 +176,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div id="stats"></div>
   <div class="grid">
     <section class="panel">
-      <h2>Streamers</h2>
+      <div class="panel-head"><h2>Streamers</h2><button class="btn" id="add-btn">＋ Add streamer</button></div>
       <div id="streamers"></div>
     </section>
     <aside>
@@ -152,6 +191,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </aside>
   </div>
 </main>
+
+<div id="modal-backdrop">
+  <div class="modal">
+    <h3>Add streamer</h3>
+    <p>Enter the Twitch username to start mining. The miner validates the
+    channel, loads its points context and subscribes to its events immediately.</p>
+    <input type="text" id="new-username" placeholder="e.g. shroud" autocomplete="off" spellcheck="false">
+    <div class="modal-actions">
+      <button class="btn btn-secondary" id="cancel-add">Cancel</button>
+      <button class="btn" id="confirm-add">Add</button>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
 
 <footer><span id="upd">waiting for data…</span> · auto-refresh 3s</footer>
 
@@ -213,11 +266,12 @@ function renderAll(d) {
         `<span class="hchip">${esc(k)} ×${v.counter} <span class="amt ${v.amount >= 0 ? "pos" : "neg"}">${signed(v.amount)}</span></span>`)
       .join("");
     return `<div class="card">
-      <div class="top">
-        <span class="dot ${s.online ? "on" : "off"}"></span>
-        <a class="name" href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.username)}</a>
-        <span class="online-tag ${s.online ? "live" : "off"}">${s.online ? "LIVE" : "OFFLINE"}</span>
-      </div>
+    <div class="top">
+      <span class="dot ${s.online ? "on" : "off"}"></span>
+      <a class="name" href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.username)}</a>
+      <span class="online-tag ${s.online ? "live" : "off"}">${s.online ? "LIVE" : "OFFLINE"}</span>
+      <button class="card-remove" title="Stop tracking ${esc(s.username)}" data-rm="${esc(s.username)}">✕</button>
+    </div>
       <div><span class="pts">${short(s.channel_points)}</span>
         <span class="gained ${gcls}">${signed(s.points_gained)} this session</span></div>
       ${s.online && s.title ? `<div class="stream-title">${esc(s.title)}</div>` : ""}
@@ -270,7 +324,75 @@ function renderAll(d) {
 
   $("upd").textContent = "updated " + new Date().toLocaleTimeString() +
     (d.status.demo ? " · demo data, no miner attached" : "");
+
+  window.__editable = !!(d.config && d.config.editable);
 }
+
+// ---------- streamer management ---------- //
+let toastTimer = null;
+function toast(msg, ok) {
+  const el = $("toast");
+  el.textContent = msg;
+  el.className = ok ? "ok" : "err";
+  el.style.display = "block";
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.style.display = "none"; }, 4000);
+}
+async function postJSON(url, body) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  let data = {};
+  try { data = await r.json(); } catch (e) {}
+  if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+  return data;
+}
+async function addStreamer(username) {
+  try {
+    await postJSON("/api/streamers/add", { username });
+    toast("Now tracking " + username, true);
+    tick();
+    return true;
+  } catch (err) {
+    toast("Could not add " + username + ": " + err.message, false);
+    return false;
+  }
+}
+async function removeStreamer(username) {
+  if (!confirm("Stop tracking " + username + "?")) return;
+  try {
+    await postJSON("/api/streamers/remove", { username });
+    toast("Stopped tracking " + username, true);
+    tick();
+  } catch (err) {
+    toast("Could not remove " + username + ": " + err.message, false);
+  }
+}
+$("add-btn").addEventListener("click", () => {
+  $("modal-backdrop").classList.add("open");
+  $("new-username").value = "";
+  $("new-username").focus();
+});
+$("cancel-add").addEventListener("click", () => $("modal-backdrop").classList.remove("open"));
+$("modal-backdrop").addEventListener("click", (e) => {
+  if (e.target === $("modal-backdrop")) $("modal-backdrop").classList.remove("open");
+});
+$("confirm-add").addEventListener("click", async () => {
+  const name = $("new-username").value.trim().toLowerCase();
+  if (!name) return;
+  const ok = await addStreamer(name);
+  if (ok) $("modal-backdrop").classList.remove("open");
+});
+$("new-username").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") $("confirm-add").click();
+  if (e.key === "Escape") $("modal-backdrop").classList.remove("open");
+});
+document.addEventListener("click", (e) => {
+  const rm = e.target.closest("[data-rm]");
+  if (rm) removeStreamer(rm.dataset.rm);
+});
 
 setInterval(() => {
   document.querySelectorAll(".countdown").forEach((el) => {

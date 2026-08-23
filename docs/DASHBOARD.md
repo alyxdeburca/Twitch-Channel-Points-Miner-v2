@@ -66,6 +66,18 @@ Notes:
   `.dashboard_session_secret` (gitignored).
 - Logout: `/auth/logout`.
 
+## Managing streamers from the dashboard
+
+The Streamers panel has an **"＋ Add streamer"** button and a ✕ button on
+each card. Adding a streamer at runtime validates the channel on Twitch,
+loads its points context, joins its chat (per settings) and subscribes to
+its WebSocket topics immediately - no restart needed. Removing stops
+tracking it right away; points already earned stay in your account.
+
+These mutations call `twitch_miner.add_streamer(name)` /
+`remove_streamer(name)`, which you can also use programmatically.
+The demo server supports them too (in-memory only).
+
 ## HTTP API
 
 | Route | Description |
@@ -74,7 +86,10 @@ Notes:
 | `/api/streamers` | per-streamer state incl. history and settings |
 | `/api/bets` | prediction events with outcomes/decisions/results |
 | `/api/events` | recent log lines from the miner's log file |
+| `/api/config` | capabilities + tracked usernames (`editable`, `demo`, `streamers`) |
 | `/api/all` | everything above in one payload |
+| `POST /api/streamers/add` | body `{"username": "name"}` — track a new streamer |
+| `POST /api/streamers/remove` | body `{"username": "name"}` — stop tracking |
 
 All require an authenticated session when OAuth is configured.
 
