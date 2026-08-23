@@ -836,7 +836,19 @@ class Twitch(object):
         json_data["variables"] = {
             "input": {"channelID": streamer.channel_id, "claimID": claim_id}
         }
-        response = self.post_gql_request(json_data)
+
+        # Claims are the most strictly protected mutation. When the
+        # headless browser is available, send the mutation FROM INSIDE
+        # the page - Chromium TLS fingerprint + native cookies are part
+        # of what Twitch's integrity check validates.
+        if self.browser_integrity is not None:
+            try:
+                response = self.browser_integrity.gql(json_data)
+            except Exception as e:
+                logger.warning(f"In-browser claim failed ({e}) - trying HTTP path")
+                response = self.post_gql_request(json_data)
+        else:
+            response = self.post_gql_request(json_data)
 
         # Surface failures: previously the response was discarded entirely,
         # so rejected claims were indistinguishable from successful ones.

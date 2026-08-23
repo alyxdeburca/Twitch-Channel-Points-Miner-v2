@@ -80,9 +80,28 @@ class BrowserIntegrity(object):
                 self._worker.start()
 
         future = concurrent.futures.Future()
-        self._jobs.put((bool(force), future))
+        self._jobs.put(({"kind": "mint"}, future))
         # Generous timeout: cold start launches Chromium + loads twitch.tv
         return future.result(timeout=150)
+
+    def gql(self, json_data):
+        """Execute a GQL operation INSIDE the page (trusted TLS+cookie
+        context). Thread-safe; returns parsed JSON response dict."""
+        if not isinstance(json_data, dict):
+            raise ValueError("json_data must be a dict")
+        with self._lock:
+            if self._stopping:
+                raise BrowserUnavailable("browser integrity is shutting down")
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(
+                    target=self._worker_loop,
+                    name="browser-integrity",
+                    daemon=True,
+                )
+                self._worker.start()
+        future = concurrent.futures.Future()
+        self._jobs.put(({"kind": "gql", "payload": json_data}, future))
+        return future.result(timeout=90)
 
     def stop(self):
         """Signal the worker to shut the browser down (best effort)."""
@@ -101,17 +120,55 @@ class BrowserIntegrity(object):
             job = self._jobs.get()
             if job is None or self._stopping:
                 break
-            _, future = job
+            spec, future = job
             if future.done():
                 continue
             try:
-                future.set_result(self._mint())
+                if spec.get("kind") == "gql":
+                    future.set_result(self._gql_in_page(spec["payload"]))
+                else:
+                    future.set_result(self._mint())
             except Exception as e:
                 message = str(e).splitlines()[0][:200]
-                logger.warning(f"Browser token minting failed: {message}")
+                logger.warning(f"Browser job failed: {message}")
                 future.set_exception(BrowserUnavailable(message))
         self._shutdown_browser()
         logger.info("Browser-integrity worker stopped")
+
+    def _gql_in_page(self, payload):
+        """POST a GQL operation from inside the loaded twitch.tv page.
+
+        The request then carries Chromium's TLS fingerprint, the device
+        cookies AND the auth cookie natively - the full trusted context
+        that Python requests cannot provide."""
+        self._ensure_browser()
+        token = self.get_token(force=False)
+        result = self._page.evaluate(
+            """
+(args) => {
+  const x = new XMLHttpRequest();
+  x.open('POST', 'https://gql.twitch.tv/gql', false);  // sync
+  x.setRequestHeader('Client-Id', 'kimne78kx3ncx6brgo4mv6wki5h1ko');
+  x.setRequestHeader('Authorization', 'OAuth ' + args.token);
+  x.setRequestHeader('Content-Type', 'application/json');
+  if (args.integrity) { x.setRequestHeader('Client-Integrity', args.integrity); }
+  try { x.send(JSON.stringify(args.payload)); }
+  catch (e) { return {__error: String(e)}; }
+  try {
+    const parsed = JSON.parse(x.responseText);
+    parsed.__status = x.status;
+    return parsed;
+  } catch (e) {
+    return {__error: 'parse ' + x.status, __body: x.responseText.slice(0,200)};
+  }
+}
+""",
+            {"token": self._current_auth_token(), "integrity": token, "payload": payload},
+        )
+        if not isinstance(result, dict) or result.get("__error"):
+            raise BrowserUnavailable(f"in-page GQL failed: {str(result)[:160]}")
+        result.pop("__status", None)
+        return result
 
     def _mint(self):
         last_error = None
