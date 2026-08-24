@@ -44,25 +44,32 @@ def _send_imessage(to_number, text):
     """Send an iMessage via the Sendblue API (credentials from env)."""
     api_key = os.environ.get("SENDBLUE_API_KEY")
     api_secret = os.environ.get("SENDBLUE_API_SECRET")
+    from_number = os.environ.get("SENDBLUE_PHONE_NUMBER")
     if not (api_key and api_secret and to_number):
         logger.warning("iMessage notify skipped: missing credentials/number")
         return False
+    body = {"number": to_number, "content": text}
+    if from_number:
+        body["from_number"] = from_number
     try:
         response = requests.post(
-            "https://api.sendblue.co/api/send-message",
+            "https://api.sendblue.com/api/send-message",
             headers={
                 "sb-api-key-id": api_key,
                 "sb-api-secret-key": api_secret,
                 "Content-Type": "application/json",
+                "Accept": "application/json",
             },
-            json={"number": to_number, "content": text, "status_callback": "none"},
-            timeout=15,
+            json=body,
+            timeout=30,
         )
-        ok = response.status_code in (200, 201)
+        ok = response.status_code in (200, 201, 202)
         if ok:
-            logger.info(f"iMessage notification sent to {to_number}")
+            logger.info(f"iMessage notification queued for {to_number}")
         else:
-            logger.warning(f"Sendblue returned {response.status_code}: {response.text[:120]}")
+            logger.warning(
+                f"Sendblue returned {response.status_code}: {response.text[:120]}"
+            )
         return ok
     except requests.RequestException as e:
         logger.warning(f"Sendblue request failed: {e}")
@@ -103,6 +110,7 @@ class Twitch(object):
         "integrity_source",
         "notify_only",
         "imessage_to",
+        "_last_bonus_notify",
     ]
 
     def __init__(self, username, user_agent):
@@ -168,6 +176,7 @@ class Twitch(object):
             not in ("1", "true", "yes")
         )
         self.imessage_to = os.environ.get("MINER_IMESSAGE_TO")
+        self._last_bonus_notify = 0
 
     def _prime_session(self):
         """Visit twitch.tv once to collect device cookies (unique_id etc.).
