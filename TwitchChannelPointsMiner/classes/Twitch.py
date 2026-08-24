@@ -698,7 +698,10 @@ class Twitch(object):
                         response = requests.post(
                             streamers[index].stream.spade_url,
                             data=streamers[index].stream.encode_payload(),
-                            headers={"User-Agent": self.user_agent},
+                            headers={
+                                "User-Agent": self.user_agent,
+                                "Content-Type": "application/json",
+                            },
                             timeout=60,
                         )
                         logger.debug(
@@ -706,6 +709,38 @@ class Twitch(object):
                         )
                         if response.status_code == 204:
                             streamers[index].stream.update_minute_watched()
+                            # Visible proof-of-life every 5 accepted beats
+                            streamers[index].stream.minute_watched_sent = (
+                                getattr(
+                                    streamers[index].stream,
+                                    "minute_watched_sent",
+                                    0,
+                                )
+                                + 1
+                            )
+                            if streamers[index].stream.minute_watched_sent % 5 == 0:
+                                logger.info(
+                                    f"[watch-hb] {streamers[index].username}: "
+                                    f"{streamers[index].stream.minute_watched_sent} heartbeats OK"
+                                )
+                        else:
+                            # Non-204 means Twitch is rejecting the heartbeat
+                            # (expired/invalid spade URL, gating, etc). Log it
+                            # loudly and refresh the URL instead of failing
+                            # silently forever.
+                            logger.error(
+                                f"[watch-hb] {streamers[index].username}: heartbeat "
+                                f"rejected HTTP {response.status_code} - refreshing spade_url"
+                            )
+                            try:
+                                self.get_spade_url(streamers[index])
+                                logger.info(
+                                    f"[watch-hb] {streamers[index].username}: spade_url refreshed"
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    f"[watch-hb] spade_url refresh failed: {e}"
+                                )
 
                             """
                             Remember, you can only earn progress towards a time-based Drop on one participating channel at a time.  [ ! ! ! ]
