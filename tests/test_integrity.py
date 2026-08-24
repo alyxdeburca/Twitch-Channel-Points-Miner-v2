@@ -92,45 +92,31 @@ class IntegrityTests(unittest.TestCase):
             self.assertEqual(self.twitch._integrity_headers(), {})
             mock_post.assert_not_called()
 
-    def test_post_gql_attaches_headers_and_retries_on_integrity_fail(self):
+    def test_post_gql_reads_go_bare(self):
+        """Regression: attaching untrusted integrity headers to ordinary
+        reads made Twitch gate them harder ('user not found'). Reads must
+        go out with NO integrity/device headers."""
         gql_calls = []
 
         def fake_post(url, json=None, headers=None, timeout=None):
             gql_calls.append(headers)
-            if len(gql_calls) == 1:
-                # First attempt lacks integrity -> rejected
-                self.assertNotIn("Client-Integrity", headers or {})
-                return FakeResp(
-                    200,
-                    {
-                        "errors": [
-                            {
-                                "message": "failed integrity check",
-                                "extensions": {"code": "IntegrityCheckFailed"},
-                            }
-                        ]
-                    },
-                )
-            # Retry must carry the integrity token
-            self.assertEqual((headers or {}).get("Client-Integrity"), "fresh")
-            return FakeResp(200, {"data": {"claimCommunityPoints": {"error": None}}})
+            return FakeResp(200, {"data": {"user": {"id": "1"}}})
 
-        header_states = [{}, {"X-Device-Id": "d", "Client-Integrity": "fresh"}]
-        with mock.patch.object(
-            Twitch,
-            "_integrity_headers",
-            side_effect=lambda *a, **k: header_states[min(len(gql_calls), 1)],
+        with mock.patch(
+            "TwitchChannelPointsMiner.classes.Twitch.requests.post",
+            side_effect=fake_post,
+        ), mock.patch.object(
+            Twitch, "_prime_session", new=staticmethod(lambda: None)
         ), mock.patch.object(
             self.twitch.http_session, "post", side_effect=fake_post
-        ), mock.patch.object(
-            Twitch,
-            "refresh_integrity_token",
-            side_effect=lambda: setattr(self.twitch, "integrity_token", "fresh"),
         ):
-            result = self.twitch.post_gql_request({"operationName": "ClaimCommunityPoints"})
+            result = self.twitch.post_gql_request({"operationName": "ReportMenuItem"})
 
-        self.assertEqual(len(gql_calls), 2)
-        self.assertEqual(result, {"data": {"claimCommunityPoints": {"error": None}}})
+        self.assertEqual(len(gql_calls), 1)
+        self.assertNotIn("X-Device-Id", gql_calls[0] or {})
+        self.assertNotIn("Client-Integrity", gql_calls[0] or {})
+        self.assertIn("Authorization", gql_calls[0])
+        self.assertEqual(result, {"data": {"user": {"id": "1"}}})
 
     def test_device_id_persisted_and_reused(self):
         import tempfile

@@ -129,7 +129,7 @@ class BrowserIntegrity(object):
                 else:
                     future.set_result(self._mint())
             except Exception as e:
-                message = str(e).splitlines()[0][:200]
+                message = (str(e) or type(e).__name__).splitlines()[0][:200]
                 logger.warning(f"Browser job failed: {message}")
                 future.set_exception(BrowserUnavailable(message))
         self._shutdown_browser()
@@ -142,7 +142,11 @@ class BrowserIntegrity(object):
         cookies AND the auth cookie natively - the full trusted context
         that Python requests cannot provide."""
         self._ensure_browser()
-        token = self.get_token(force=False)
+        # We are ON the worker thread: NEVER route token requests back
+        # through the queue (deadlock). Mint directly if cache is stale.
+        token = self.token
+        if not token or time.time() >= self.expires - 120:
+            token = self._mint()
         result = self._page.evaluate(
             """
 (args) => {

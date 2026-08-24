@@ -40,6 +40,35 @@ from TwitchChannelPointsMiner.utils import (
 logger = logging.getLogger(__name__)
 
 
+def _send_imessage(to_number, text):
+    """Send an iMessage via the Sendblue API (credentials from env)."""
+    api_key = os.environ.get("SENDBLUE_API_KEY")
+    api_secret = os.environ.get("SENDBLUE_API_SECRET")
+    if not (api_key and api_secret and to_number):
+        logger.warning("iMessage notify skipped: missing credentials/number")
+        return False
+    try:
+        response = requests.post(
+            "https://api.sendblue.co/api/send-message",
+            headers={
+                "sb-api-key-id": api_key,
+                "sb-api-secret-key": api_secret,
+                "Content-Type": "application/json",
+            },
+            json={"number": to_number, "content": text, "status_callback": "none"},
+            timeout=15,
+        )
+        ok = response.status_code in (200, 201)
+        if ok:
+            logger.info(f"iMessage notification sent to {to_number}")
+        else:
+            logger.warning(f"Sendblue returned {response.status_code}: {response.text[:120]}")
+        return ok
+    except requests.RequestException as e:
+        logger.warning(f"Sendblue request failed: {e}")
+        return False
+
+
 def _safe_resync(twitch, streamer):
     """Best-effort points refresh after a claim; never raises.
 
@@ -72,6 +101,8 @@ class Twitch(object):
         "_session_primed",
         "browser_integrity",
         "integrity_source",
+        "notify_only",
+        "imessage_to",
     ]
 
     def __init__(self, username, user_agent):
@@ -130,6 +161,13 @@ class Twitch(object):
                 logger.warning(f"Browser integrity init failed: {e}")
         # Which source supplied the last integrity payload (for diagnostics)
         self.integrity_source = "http"
+        # Notify-only mode: ping via iMessage instead of auto-claiming
+        # (default ON; MINER_AUTOCLAIM=1 restores old behavior).
+        self.notify_only = (
+            os.environ.get("MINER_AUTOCLAIM", "").strip().lower()
+            not in ("1", "true", "yes")
+        )
+        self.imessage_to = os.environ.get("MINER_IMESSAGE_TO")
 
     def _prime_session(self):
         """Visit twitch.tv once to collect device cookies (unique_id etc.).
@@ -447,18 +485,34 @@ class Twitch(object):
         last_cursor = ""
         follows = []
         while has_next is True:
-            json_data["variables"]["cursor"] = last_cursor
+            # NOTE: sending "cursor": "" makes Twitch reject this query
+            # with IntegrityCheckFailed. The key must be OMITTED entirely
+            # on the first page, and each subsequent page must use its OWN
+            # fresh cursor (reusing one also triggers IntegrityCheckFailed).
+            if last_cursor:
+                json_data["variables"]["cursor"] = last_cursor
+            else:
+                json_data["variables"].pop("cursor", None)
             json_response = self.post_gql_request(json_data)
-            try:
-                follows_response = json_response["data"]["user"]["follows"]
-                last_cursor = None
-                for f in follows_response["edges"]:
-                    follows.append(f["node"]["login"].lower())
-                    last_cursor = f["cursor"]
+            # Twitch answers gated pages with follows: null (plus errors).
+            if not isinstance(json_response, dict):
+                return follows
+            follows_response = (json_response.get("data") or {}).get("user") or {}
+            follows_response = follows_response.get("follows")
+            if not isinstance(follows_response, dict) or "edges" not in follows_response:
+                # Twitch gates PAGINATED follow requests (>100) with
+                # IntegrityCheckFailed for untrusted clients. Return what
+                # we collected from earlier pages rather than crashing.
+                logger.warning(
+                    "get_followers: further pages blocked by Twitch - returning "
+                    f"the {len(follows)} follows collected so far"
+                )
+                return follows
+            for f in follows_response["edges"]:
+                follows.append(f["node"]["login"].lower())
+                last_cursor = f["cursor"]  # ALWAYS advance to this page's last cursor
 
-                has_next = follows_response["pageInfo"]["hasNextPage"]
-            except KeyError:
-                return []
+            has_next = follows_response["pageInfo"]["hasNextPage"]
         return follows
 
     def update_raid(self, streamer, raid):
@@ -518,41 +572,14 @@ class Twitch(object):
             )
 
         try:
-            # Attach device id + client-integrity up front: Twitch rejects
-            # sensitive mutations (claims, predictions) otherwise.
-            response = _post(self._integrity_headers())
+            # Regular reads work best BARE: attaching an untrusted (HTTP-
+            # minted) integrity token makes Twitch gate ordinary queries
+            # more aggressively. Only claim_bonus uses trusted in-browser
+            # execution.
+            response = _post({})
             logger.debug(
                 f"Data: {json_data}, Status code: {response.status_code}, Content: {response.text}"
             )
-
-            # One automatic retry with a freshly minted integrity token
-            def _integrity_failed(resp):
-                try:
-                    return any(
-                        (e or {}).get("extensions", {}).get("code")
-                        == "IntegrityCheckFailed"
-                        for e in resp.json().get("errors", [])
-                    )
-                except Exception:
-                    return False
-
-            if response.status_code == 200 and _integrity_failed(response):
-                logger.info("Integrity check failed - refreshing token and retrying once")
-                self.integrity_token = None
-                self.integrity_expires = 0
-                self.refresh_integrity_token()
-                if self.integrity_token:
-                    # Force one full retry cycle with the fresh token; if it
-                    # still fails, drop the headers entirely (proven bare path)
-                    response = _post(self._integrity_headers())
-                    logger.debug(
-                        f"Retry Data: {json_data}, Status code: {response.status_code}, Content: {response.text}"
-                    )
-                if response.status_code == 200 and _integrity_failed(response):
-                    logger.info("Still rejected - falling back to bare request")
-                    self.integrity_token = None
-                    self.integrity_expires = time.time() + 300
-                    response = _post({})
 
             return response.json()
         except requests.exceptions.RequestException as e:
@@ -824,7 +851,35 @@ class Twitch(object):
                 },
             )
 
+    def _notify_bonus_available(self, streamer):
+        """Ping the user's phone that a bonus is waiting (throttled)."""
+        now = time.time()
+        if now - getattr(self, "_last_bonus_notify", 0) < 120:
+            return
+        self._last_bonus_notify = now
+        username = getattr(streamer, "username", "?")
+        points = getattr(streamer, "channel_points", 0)
+        logger.info(
+            f"Bonus available on {username} - notifying",
+            extra={"emoji": ":gift:", "event": Events.BONUS_CLAIM},
+        )
+        _send_imessage(
+            self.imessage_to,
+            f"🎁 Bonus available on {username} — open the dashboard: "
+            f"https://miner.alyx.site (balance: {points})",
+        )
+
     def claim_bonus(self, streamer, claim_id):
+        """Handle a bonus-claim event.
+
+        In notify-only mode (default; enable auto-claim with
+        MINER_AUTOCLAIM=1) this sends an iMessage ping instead of
+        attempting the mutation - Twitch currently rejects non-browser
+        claims with IntegrityCheckFailed."""
+        if getattr(self, "notify_only", False):
+            self._notify_bonus_available(streamer)
+            return False
+
         """Claim a channel-points bonus. Returns True if Twitch accepted it."""
         if Settings.logger.less is False:
             logger.info(
