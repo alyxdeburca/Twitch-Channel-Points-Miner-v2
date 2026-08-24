@@ -23,6 +23,7 @@ class Stream(object):
         "payload",
         "watch_streak_missing",
         "minute_watched",
+        "minute_watched_sent",
         "__last_update",
         "__minute_watched_timestamp",
     ]
@@ -45,6 +46,7 @@ class Stream(object):
         self.payload = None
 
         self.init_watch_streak()
+        self.minute_watched_sent = 0
 
     def encode_payload(self) -> dict:
         json_event = json.dumps(self.payload, separators=(",", ":"))
