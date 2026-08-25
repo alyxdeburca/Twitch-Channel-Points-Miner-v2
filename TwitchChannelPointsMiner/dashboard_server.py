@@ -622,6 +622,36 @@ class DashboardServer(Thread):
                 return False, f"failed to apply: {e}"
             return True, None
 
+    def refresh_online_status(self):
+        """Force an online/offline re-check of every tracked channel.
+
+        Uses check_streamer_online when available (full spade/stream
+        update); falls back to load_channel_points_context otherwise.
+        Returns (checked, online_count)."""
+        miner = getattr(self.state, "miner", None)
+        if miner is None:
+            return 0, 0
+        twitch = getattr(miner, "twitch", None)
+        streamers = getattr(miner, "streamers", None) or []
+        checked = 0
+        online = 0
+        for streamer in streamers:
+            try:
+                if hasattr(twitch, "check_streamer_online"):
+                    # bypass the 60s offline cache so a refresh really refreshes
+                    streamer.offline_at = 0
+                    twitch.check_streamer_online(streamer)
+                else:
+                    twitch.load_channel_points_context(streamer)
+                checked += 1
+                if getattr(streamer, "is_online", False):
+                    online += 1
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    f"refresh failed for {getattr(streamer, 'username', '?')}: {e}"
+                )
+        return checked, online
+
     def remove_streamer(self, username):
         """Remove a tracked streamer. Returns (ok, error)."""
         username = str(username or "").strip()
@@ -873,6 +903,15 @@ class DashboardServer(Thread):
                     return self._json(
                         {"success": ok, "error": error},
                         status=200 if ok else 400,
+                    )
+                if path == "/api/streamers/refresh":
+                    checked, online = server.refresh_online_status()
+                    return self._json(
+                        {
+                            "success": True,
+                            "checked": checked,
+                            "online": online,
+                        }
                     )
                 return self._json({"error": "not found"}, status=404)
 

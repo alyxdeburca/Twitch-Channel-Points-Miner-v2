@@ -225,7 +225,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div id="stats"></div>
   <div class="grid">
     <section class="panel">
-      <div class="panel-head"><h2>Streamers</h2><button class="btn" id="add-btn">＋ Add streamer</button></div>
+      <div class="panel-head"><h2>Streamers</h2>
+        <div style="display:flex; gap:8px;">
+          <button class="btn" id="refresh-btn" title="Re-check online status for every channel">⟳ Refresh</button>
+          <button class="btn" id="add-btn">＋ Add streamer</button>
+        </div>
+      </div>
       <div id="streamers"></div>
     </section>
     <aside>
@@ -441,6 +446,26 @@ $("add-btn").addEventListener("click", () => {
   $("modal-backdrop").classList.add("open");
   $("new-username").value = "";
   $("new-username").focus();
+});
+$("refresh-btn").addEventListener("click", async () => {
+  const btn = $("refresh-btn");
+  btn.disabled = true;
+  btn.textContent = "⟳ Checking...";
+  try {
+    const r = await fetch("/api/streamers/refresh", { method: "POST" });
+    const data = await r.json();
+    if (data.success) {
+      toast(`Checked ${data.checked} channel${data.checked === 1 ? "" : "s"} — ${data.online} online`, true);
+    } else {
+      toast("Refresh failed", false);
+    }
+    tick(); // immediately re-render with fresh online states
+  } catch (err) {
+    toast("Refresh failed: " + err.message, false);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "⟳ Refresh";
+  }
 });
 $("cancel-add").addEventListener("click", () => $("modal-backdrop").classList.remove("open"));
 $("modal-backdrop").addEventListener("click", (e) => {

@@ -110,7 +110,7 @@ class Twitch(object):
         "integrity_source",
         "notify_only",
         "imessage_to",
-        "_last_bonus_notify",
+        "_bonus_notified",
     ]
 
     def __init__(self, username, user_agent):
@@ -176,7 +176,9 @@ class Twitch(object):
             not in ("1", "true", "yes")
         )
         self.imessage_to = os.environ.get("MINER_IMESSAGE_TO")
-        self._last_bonus_notify = 0
+        # Channels we've already pinged about the current bonus. Reset when
+        # the bonus disappears so the next one notifies again.
+        self._bonus_notified = set()
 
     def _prime_session(self):
         """Visit twitch.tv once to collect device cookies (unique_id etc.).
@@ -815,6 +817,9 @@ class Twitch(object):
 
             if no_side_effects is False and community_points["availableClaim"] is not None:
                 self.claim_bonus(streamer, community_points["availableClaim"]["id"])
+            elif no_side_effects is False:
+                # No bonus showing anymore - re-arm the once-per-bonus notify.
+                self._notify_bonus_available(streamer, False)
 
     def make_predictions(self, event):
         decision = event.bet.calculate(event.streamer.channel_points)
@@ -895,23 +900,31 @@ class Twitch(object):
                 },
             )
 
-    def _notify_bonus_available(self, streamer):
-        """Ping the user's phone that a bonus is waiting (throttled)."""
-        now = time.time()
-        if now - getattr(self, "_last_bonus_notify", 0) < 120:
-            return
-        self._last_bonus_notify = now
+    def _notify_bonus_available(self, streamer, bonus_available):
+        """Ping the user's phone that a bonus is waiting.
+
+        Notify ONCE per channel per bonus: track which channels we've
+        already pinged. When a channel no longer shows an availableClaim,
+        clear it so the next bonus notifies again.
+        """
         username = getattr(streamer, "username", "?")
-        points = getattr(streamer, "channel_points", 0)
-        logger.info(
-            f"Bonus available on {username} - notifying",
-            extra={"emoji": ":gift:", "event": Events.BONUS_CLAIM},
-        )
-        _send_imessage(
-            self.imessage_to,
-            f"🎁 Bonus available on {username} — open the dashboard: "
-            f"https://miner.alyx.site (balance: {points})",
-        )
+        if bonus_available:
+            if username in self._bonus_notified:
+                return  # already pinged for this bonus
+            self._bonus_notified.add(username)
+            points = getattr(streamer, "channel_points", 0)
+            logger.info(
+                f"Bonus available on {username} - notifying (once per bonus)",
+                extra={"emoji": ":gift:", "event": Events.BONUS_CLAIM},
+            )
+            _send_imessage(
+                self.imessage_to,
+                f"🎁 Bonus available on {username} — open the dashboard: "
+                f"https://miner.alyx.site (balance: {points})",
+            )
+        else:
+            # Bonus gone (claimed or expired) - re-arm the notification.
+            self._bonus_notified.discard(username)
 
     def claim_bonus(self, streamer, claim_id):
         """Handle a bonus-claim event.
@@ -921,7 +934,7 @@ class Twitch(object):
         attempting the mutation - Twitch currently rejects non-browser
         claims with IntegrityCheckFailed."""
         if getattr(self, "notify_only", False):
-            self._notify_bonus_available(streamer)
+            self._notify_bonus_available(streamer, True)
             return False
 
         """Claim a channel-points bonus. Returns True if Twitch accepted it."""
