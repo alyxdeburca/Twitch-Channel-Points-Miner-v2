@@ -156,3 +156,4 @@ analytics/*
 .dashboard_channels.json
 .dashboard/
 avatars/
+.dashboard_watchdog.json
