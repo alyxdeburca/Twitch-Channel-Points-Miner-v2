@@ -342,6 +342,11 @@ class WebSocketsPool:
                                 ws.streamers[streamer_index].update_history(
                                     "PREDICTION", points["gained"]
                                 )
+                                # Feed cleanup: clear resolved predictions so
+                                # the dashboard / event feed doesn't stay full
+                                # with old bets forever.
+                                if event_id in ws.events_predictions:
+                                    del ws.events_predictions[event_id]
 
                                 # Remove duplicate history records from previous message sent in community-points-user-v1
                                 if event_prediction.result["type"] == "REFUND":
